@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
+mod elo_versus_games;
 mod games_per_week;
 mod records;
 
@@ -21,5 +22,6 @@ pub fn available() -> Vec<Box<dyn Analysis>> {
     vec![
         Box::new(records::RecordCount),
         Box::new(games_per_week::GamesPerWeek),
+        Box::new(elo_versus_games::EloVersusGames),
     ]
 }

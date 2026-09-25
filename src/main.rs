@@ -1,17 +1,19 @@
 mod analysis;
 
 use analysis::DatasetFile;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_DATASET: &str = "dataset/seasons_10_11.parquet";
 const DEFAULT_SEASONS: &[u32] = &[10, 11];
 
 struct Options {
     dataset: PathBuf,
-    seasons: Vec<u32>,
+    seasons: Option<Vec<u32>>,
     analysis: String,
     output: Option<PathBuf>,
 }
@@ -22,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => return Ok(()),
     };
 
-    let files = find_season_files(&options.dataset, &options.seasons)?;
+    let files = find_season_files(&options.dataset, options.seasons.as_deref())?;
     let analyses = analysis::available();
     let selected = analyses
         .iter()
@@ -46,8 +48,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, Box<dyn Error>> {
-    let mut dataset = PathBuf::from("dataset/seasons_10_11.parquet");
-    let mut seasons = DEFAULT_SEASONS.to_vec();
+    let mut dataset = PathBuf::from(DEFAULT_DATASET);
+    let mut dataset_explicit = false;
+    let mut seasons = Some(DEFAULT_SEASONS.to_vec());
+    let mut seasons_explicit = false;
     let mut analysis = String::from("records");
     let mut output = None;
     let mut args = args;
@@ -59,16 +63,18 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
                 return Ok(None);
             }
             Some("--dataset") => {
+                dataset_explicit = true;
                 dataset = args
                     .next()
                     .map(PathBuf::from)
                     .ok_or_else(|| invalid_arg("--dataset requires a directory"))?;
             }
             Some("--seasons") => {
+                seasons_explicit = true;
                 let value = args
                     .next()
                     .ok_or_else(|| invalid_arg("--seasons requires a comma-separated list"))?;
-                seasons = value
+                let mut selected_seasons = value
                     .to_str()
                     .ok_or_else(|| invalid_arg("season list must be valid UTF-8"))?
                     .split(',')
@@ -78,11 +84,12 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
                             .map_err(|_| invalid_arg("seasons must be positive integers"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if seasons.is_empty() || seasons.contains(&0) {
+                if selected_seasons.is_empty() || selected_seasons.contains(&0) {
                     return Err(invalid_arg("seasons must be positive integers").into());
                 }
-                seasons.sort_unstable();
-                seasons.dedup();
+                selected_seasons.sort_unstable();
+                selected_seasons.dedup();
+                seasons = Some(selected_seasons);
             }
             Some("--analysis") => {
                 analysis = args
@@ -106,6 +113,15 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
         }
     }
 
+    if analysis == "elo-versus-games" {
+        if !dataset_explicit {
+            dataset = PathBuf::from("dataset");
+        }
+        if !seasons_explicit {
+            seasons = None;
+        }
+    }
+
     Ok(Some(Options {
         dataset,
         seasons,
@@ -114,7 +130,10 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
     }))
 }
 
-fn find_season_files(dataset: &Path, seasons: &[u32]) -> Result<Vec<DatasetFile>, Box<dyn Error>> {
+fn find_season_files(
+    dataset: &Path,
+    seasons: Option<&[u32]>,
+) -> Result<Vec<DatasetFile>, Box<dyn Error>> {
     if dataset.is_file() {
         if !is_parquet_file(dataset) {
             return Err(io::Error::new(
@@ -143,8 +162,23 @@ fn find_season_files(dataset: &Path, seasons: &[u32]) -> Result<Vec<DatasetFile>
     let mut paths = Vec::new();
     collect_parquet_files(dataset, &mut paths)?;
 
+    let requested_seasons: Vec<u32> = if let Some(seasons) = seasons {
+        seasons.to_vec()
+    } else {
+        paths
+            .iter()
+            .filter_map(|path| {
+                let name = path.file_name()?.to_str()?;
+                let remainder = name.strip_prefix("season_")?;
+                let (season, _) = remainder.split_once('_')?;
+                season.parse().ok()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
     let mut files = Vec::new();
-    for season in seasons {
+    for season in &requested_seasons {
         let prefix = format!("season_{season}_");
         let mut matching: Vec<_> = paths
             .iter()
@@ -207,6 +241,7 @@ fn print_help() {
         "Usage: rankewd [--dataset FILE_OR_DIR] [--seasons N[,N...]] [--analysis NAME] [--output PNG]\n\
          Defaults: --dataset dataset/seasons_10_11.parquet --seasons 10,11 --analysis records\n\
          games-per-week writes games_per_week.png unless --output is set\n\
+         elo-versus-games defaults to all files named season_N_*.parquet in dataset/ and writes per-season charts plus dataset/player_elos.parquet\n\
          Available analyses: {}",
         analysis::available()
             .iter()

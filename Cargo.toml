@@ -7,5 +7,7 @@ edition = "2024"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parquet = "60"
+arrow-array = "60"
+arrow-schema = "60"
 chrono = "0.4"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf", "line_series", "point_series"] }
