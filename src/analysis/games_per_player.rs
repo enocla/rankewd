@@ -29,7 +29,7 @@ impl Analysis for GamesPerPlayer {
     }
 
     fn run(&self, input: &AnalysisInput<'_>) -> Result<AnalysisReport, Box<dyn Error>> {
-        let data = PlayerSeasons::load(
+        let data = PlayerSeasons::load_summaries(
             input.files().iter().map(|file| file.path.as_path()),
             input.seasons(),
         )?;

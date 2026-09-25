@@ -9,6 +9,7 @@ use chrono::{DateTime, Datelike, Duration, Utc};
 use parquet::file::reader::FileReader;
 use parquet::schema::parser::parse_message_type;
 use plotters::prelude::*;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
@@ -23,6 +24,8 @@ const MAX_X_LABELS: usize = 12;
 const DATA_POINT_RADIUS: i32 = 4;
 
 pub(super) struct GamesPerWeek;
+
+type WeekCounts = BTreeMap<(i32, u32), u64>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WeeklyCount {
@@ -55,33 +58,56 @@ fn collect_games_by_week(
     input: &AnalysisInput<'_>,
 ) -> Result<BTreeMap<(i32, u32), u64>, Box<dyn Error>> {
     let mut games_by_week = BTreeMap::new();
+    let projection = parse_message_type(DATE_SEASON_PROJECTION)?;
 
     for file in input.files() {
         let reader = dataset::open(&file.path)?;
-        let projection = parse_message_type(DATE_SEASON_PROJECTION)?;
-        for row in reader.get_row_iter(Some(projection.clone()))? {
-            let row = row?;
-            let season = dataset::integer_field(&row, "season")?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
-            let season = u32::try_from(season).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
-            })?;
-            if !input.includes_season(season) {
-                continue;
-            }
+        let chunks: Result<Vec<WeekCounts>, io::Error> = (0..reader.num_row_groups())
+            .into_par_iter()
+            .filter(|&index| dataset::row_group_matches(&reader, index, input.seasons()))
+            .map(|index| {
+                let worker_reader = dataset::open(&file.path)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let row_group = worker_reader
+                    .get_row_group(index)
+                    .map_err(io::Error::other)?;
+                let mut counts = BTreeMap::new();
+                for row in row_group
+                    .get_row_iter(Some(projection.clone()))
+                    .map_err(io::Error::other)?
+                {
+                    let row = row.map_err(io::Error::other)?;
+                    let season = dataset::integer_field(&row, "season")?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing season")
+                    })?;
+                    let season = u32::try_from(season).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
+                    })?;
+                    if !input.includes_season(season) {
+                        continue;
+                    }
 
-            let timestamp = dataset::integer_field(&row, "date")?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing match date"))?;
-            let date = DateTime::<Utc>::from_timestamp(timestamp, 0).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "date is outside supported range",
-                )
-            })?;
-            let iso_week = date.iso_week();
-            *games_by_week
-                .entry((iso_week.year(), iso_week.week()))
-                .or_default() += 1;
+                    let timestamp = dataset::integer_field(&row, "date")?.ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing match date")
+                    })?;
+                    let date = DateTime::<Utc>::from_timestamp(timestamp, 0).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "date is outside supported range",
+                        )
+                    })?;
+                    let iso_week = date.iso_week();
+                    *counts
+                        .entry((iso_week.year(), iso_week.week()))
+                        .or_default() += 1;
+                }
+                Ok(counts)
+            })
+            .collect();
+        for counts in chunks? {
+            for (week, games) in counts {
+                *games_by_week.entry(week).or_default() += games;
+            }
         }
     }
 

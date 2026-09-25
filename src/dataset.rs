@@ -1,9 +1,11 @@
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::statistics::Statistics;
 use parquet::record::{Field, List, Row};
 use parquet::schema::parser::parse_message_type;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
@@ -22,6 +24,21 @@ const WINRATE_SAMPLE_SIZE: usize = 100;
 const WINRATE_SAMPLE_SEED: u64 = 0x5241_4e4b_4557_4432;
 const PLAYER_PROJECTION: &str = "message root { \
     optional int64 id; \
+    optional int64 date; \
+    optional int64 season; \
+    optional group result { \
+        optional binary uuid (STRING); \
+    } \
+    optional group players (LIST) { \
+        repeated group list { \
+            optional group element { \
+                optional binary uuid (STRING); \
+                optional int64 eloRate; \
+            } \
+        } \
+    } \
+}";
+const PLAYER_SUMMARY_PROJECTION: &str = "message root { \
     optional int64 date; \
     optional int64 season; \
     optional group result { \
@@ -73,47 +90,44 @@ pub(crate) fn record_count_for_seasons(
     Ok(count)
 }
 
-pub(crate) fn integer_field(row: &Row, name: &str) -> Result<Option<i64>, Box<dyn Error>> {
+pub(crate) fn integer_field(row: &Row, name: &str) -> io::Result<Option<i64>> {
     let value = find_field(row, name)?;
     match value {
         Some(Field::Long(value)) => Ok(Some(*value)),
         Some(Field::Int(value)) => Ok(Some(i64::from(*value))),
         Some(Field::Null) => Ok(None),
-        Some(value) => Err(invalid_field(name, value).into()),
-        None => Err(missing_field(name).into()),
+        Some(value) => Err(invalid_field(name, value)),
+        None => Err(missing_field(name)),
     }
 }
 
-pub(crate) fn string_field<'a>(
-    row: &'a Row,
-    name: &str,
-) -> Result<Option<&'a str>, Box<dyn Error>> {
+pub(crate) fn string_field<'a>(row: &'a Row, name: &str) -> io::Result<Option<&'a str>> {
     let value = find_field(row, name)?;
     match value {
         Some(Field::Str(value)) => Ok(Some(value)),
         Some(Field::Null) => Ok(None),
-        Some(value) => Err(invalid_field(name, value).into()),
-        None => Err(missing_field(name).into()),
+        Some(value) => Err(invalid_field(name, value)),
+        None => Err(missing_field(name)),
     }
 }
 
-pub(crate) fn list_field<'a>(row: &'a Row, name: &str) -> Result<Option<&'a List>, Box<dyn Error>> {
+pub(crate) fn list_field<'a>(row: &'a Row, name: &str) -> io::Result<Option<&'a List>> {
     let value = find_field(row, name)?;
     match value {
         Some(Field::ListInternal(value)) => Ok(Some(value)),
         Some(Field::Null) => Ok(None),
-        Some(value) => Err(invalid_field(name, value).into()),
-        None => Err(missing_field(name).into()),
+        Some(value) => Err(invalid_field(name, value)),
+        None => Err(missing_field(name)),
     }
 }
 
-pub(crate) fn group_field<'a>(row: &'a Row, name: &str) -> Result<Option<&'a Row>, Box<dyn Error>> {
+pub(crate) fn group_field<'a>(row: &'a Row, name: &str) -> io::Result<Option<&'a Row>> {
     let value = find_field(row, name)?;
     match value {
         Some(Field::Group(value)) => Ok(Some(value)),
         Some(Field::Null) => Ok(None),
-        Some(value) => Err(invalid_field(name, value).into()),
-        None => Err(missing_field(name).into()),
+        Some(value) => Err(invalid_field(name, value)),
+        None => Err(missing_field(name)),
     }
 }
 
@@ -137,6 +151,12 @@ pub(crate) fn invalid_field(name: &str, value: &Field) -> io::Error {
 /// Player rows and per-season match history read from the selected datasets.
 pub(crate) struct PlayerSeasons {
     players: Vec<PlayerSeason>,
+    history_by_season: BTreeMap<u32, SeasonHistory>,
+}
+
+#[derive(Default)]
+struct PlayerSeasonsChunk {
+    players: BTreeMap<(u32, String), PlayerSeason>,
     history_by_season: BTreeMap<u32, SeasonHistory>,
 }
 
@@ -206,134 +226,266 @@ impl PlayerSeason {
     }
 }
 
+/// Statistics are optional; a missing or unrecognized value must be read normally.
+pub(crate) fn row_group_matches(
+    reader: &ParquetFile,
+    index: usize,
+    seasons: Option<&[u32]>,
+) -> bool {
+    let Some(seasons) = seasons else {
+        return true;
+    };
+    let Some(column) = reader
+        .metadata()
+        .row_group(index)
+        .columns()
+        .iter()
+        .find(|column| {
+            column.column_path().parts().len() == 1 && column.column_path().parts()[0] == "season"
+        })
+    else {
+        return true;
+    };
+    let bounds = match column.statistics() {
+        Some(Statistics::Int64(stats)) => {
+            stats.min_opt().zip(stats.max_opt()).map(|(a, b)| (*a, *b))
+        }
+        Some(Statistics::Int32(stats)) => stats
+            .min_opt()
+            .zip(stats.max_opt())
+            .map(|(a, b)| (i64::from(*a), i64::from(*b))),
+        _ => None,
+    };
+    bounds.is_none_or(|(min, max)| {
+        seasons
+            .iter()
+            .any(|season| (min..=max).contains(&i64::from(*season)))
+    })
+}
+
+impl PlayerSeasonsChunk {
+    fn add_row(
+        &mut self,
+        row: &Row,
+        seasons: Option<&[u32]>,
+        keep_history: bool,
+    ) -> io::Result<()> {
+        let season = integer_field(row, "season")?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
+        let season = u32::try_from(season).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
+        })?;
+        if seasons.is_some_and(|requested| !requested.contains(&season)) {
+            return Ok(());
+        }
+
+        let date = integer_field(row, "date")?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing match date"))?;
+        let match_id = if keep_history {
+            integer_field(row, "id")?.unwrap_or_default()
+        } else {
+            0
+        };
+        let season_history = self.history_by_season.entry(season).or_default();
+        season_history.first_date = Some(
+            season_history
+                .first_date
+                .map_or(date, |first| first.min(date)),
+        );
+        season_history.last_date =
+            Some(season_history.last_date.map_or(date, |last| last.max(date)));
+
+        let Some(participants) = list_field(row, "players")? else {
+            return Ok(());
+        };
+        let winner_uuid = group_field(row, "result")?
+            .map(|result| string_field(result, "uuid"))
+            .transpose()?
+            .flatten();
+        let mut match_participants = Vec::new();
+        let mut seen_in_match = HashSet::new();
+
+        for participant in participants.elements() {
+            let Field::Group(participant) = participant else {
+                return Err(invalid_field("player entry", participant));
+            };
+            let Some(uuid) = string_field(participant, "uuid")? else {
+                continue;
+            };
+            if !seen_in_match.insert(uuid.to_owned()) {
+                continue;
+            }
+
+            match_participants.push(Participant {
+                uuid: uuid.to_owned(),
+                elo: integer_field(participant, "eloRate")?,
+            });
+        }
+        let has_winner = winner_uuid.as_ref().is_some_and(|winner| {
+            match_participants
+                .iter()
+                .any(|participant| &participant.uuid == winner)
+        });
+
+        for participant in match_participants {
+            let won = winner_uuid
+                .as_ref()
+                .is_some_and(|winner| winner == &participant.uuid);
+            let player = self
+                .players
+                .entry((season, participant.uuid.clone()))
+                .or_insert_with(|| PlayerSeason {
+                    season,
+                    uuid: participant.uuid.clone(),
+                    games_played: 0,
+                    wins: 0,
+                    decided_matches: 0,
+                    latest_elo: None,
+                    latest_elo_date: None,
+                });
+            player.games_played = player.games_played.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "games played overflow")
+            })?;
+            if has_winner {
+                player.decided_matches =
+                    player.decided_matches.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "decided match count overflow")
+                    })?;
+                if won {
+                    player.wins = player.wins.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "win count overflow")
+                    })?;
+                }
+            }
+            if let Some(elo) = participant.elo
+                && player
+                    .latest_elo_date
+                    .is_none_or(|latest_date| date >= latest_date)
+            {
+                player.latest_elo = Some(elo);
+                player.latest_elo_date = Some(date);
+            }
+            if keep_history {
+                season_history
+                    .players
+                    .entry(participant.uuid)
+                    .or_default()
+                    .push(TemporalEvent {
+                        date,
+                        match_id,
+                        elo: participant.elo,
+                        won,
+                        decided: has_winner,
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, chunk: Self) -> io::Result<()> {
+        for (key, incoming) in chunk.players {
+            if let Some(player) = self.players.get_mut(&key) {
+                player.games_played = player
+                    .games_played
+                    .checked_add(incoming.games_played)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "games played overflow")
+                    })?;
+                player.decided_matches = player
+                    .decided_matches
+                    .checked_add(incoming.decided_matches)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "decided match count overflow")
+                    })?;
+                player.wins = player.wins.checked_add(incoming.wins).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "win count overflow")
+                })?;
+                if let Some(date) = incoming.latest_elo_date
+                    && player
+                        .latest_elo_date
+                        .is_none_or(|latest_date| date >= latest_date)
+                {
+                    player.latest_elo = incoming.latest_elo;
+                    player.latest_elo_date = Some(date);
+                }
+            } else {
+                self.players.insert(key, incoming);
+            }
+        }
+        for (season, history) in chunk.history_by_season {
+            let merged = self.history_by_season.entry(season).or_default();
+            if let Some(date) = history.first_date {
+                merged.first_date = Some(merged.first_date.map_or(date, |first| first.min(date)));
+            }
+            if let Some(date) = history.last_date {
+                merged.last_date = Some(merged.last_date.map_or(date, |last| last.max(date)));
+            }
+            for (uuid, mut events) in history.players {
+                merged.players.entry(uuid).or_default().append(&mut events);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PlayerSeasons {
     /// Reads player totals and match history for every requested season.
     pub(crate) fn load<'a>(
         paths: impl IntoIterator<Item = &'a Path>,
         seasons: Option<&[u32]>,
     ) -> Result<Self, Box<dyn Error>> {
-        let mut players = BTreeMap::<(u32, String), PlayerSeason>::new();
-        let mut history_by_season = BTreeMap::<u32, SeasonHistory>::new();
+        Self::load_inner(paths, seasons, true)
+    }
+
+    /// Reads only season totals for plots that do not use match history.
+    pub(crate) fn load_summaries<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        seasons: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::load_inner(paths, seasons, false)
+    }
+
+    fn load_inner<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        seasons: Option<&[u32]>,
+        keep_history: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut combined = PlayerSeasonsChunk::default();
+        let projection = parse_message_type(if keep_history {
+            PLAYER_PROJECTION
+        } else {
+            PLAYER_SUMMARY_PROJECTION
+        })?;
 
         for path in paths {
             let reader = open(path)?;
-            let projection = parse_message_type(PLAYER_PROJECTION)?;
-
-            for row in reader.get_row_iter(Some(projection.clone()))? {
-                let row = row?;
-                let season = integer_field(&row, "season")?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
-                let season = u32::try_from(season).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
-                })?;
-                if seasons.is_some_and(|requested| !requested.contains(&season)) {
-                    continue;
-                }
-
-                let date = integer_field(&row, "date")?.ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "missing match date")
-                })?;
-                let match_id = integer_field(&row, "id")?.unwrap_or_default();
-                let season_history = history_by_season.entry(season).or_default();
-                season_history.first_date = Some(
-                    season_history
-                        .first_date
-                        .map_or(date, |first_date| first_date.min(date)),
-                );
-                season_history.last_date = Some(
-                    season_history
-                        .last_date
-                        .map_or(date, |last_date| last_date.max(date)),
-                );
-
-                let Some(participants) = list_field(&row, "players")? else {
-                    continue;
-                };
-                let winner_uuid = group_field(&row, "result")?
-                    .map(|result| string_field(result, "uuid"))
-                    .transpose()?
-                    .flatten();
-                let mut match_participants = Vec::new();
-                let mut seen_in_match = HashSet::new();
-
-                for participant in participants.elements() {
-                    let Field::Group(participant) = participant else {
-                        return Err(invalid_field("player entry", participant).into());
-                    };
-                    let Some(uuid) = string_field(participant, "uuid")? else {
-                        continue;
-                    };
-                    if !seen_in_match.insert(uuid.to_owned()) {
-                        continue;
-                    }
-
-                    match_participants.push(Participant {
-                        uuid: uuid.to_owned(),
-                        elo: integer_field(participant, "eloRate")?,
-                    });
-                }
-                let has_winner = winner_uuid.as_ref().is_some_and(|winner| {
-                    match_participants
-                        .iter()
-                        .any(|participant| &participant.uuid == winner)
-                });
-
-                for participant in match_participants {
-                    let won = winner_uuid
-                        .as_ref()
-                        .is_some_and(|winner| winner == &participant.uuid);
-                    let player = players
-                        .entry((season, participant.uuid.clone()))
-                        .or_insert_with(|| PlayerSeason {
-                            season,
-                            uuid: participant.uuid.clone(),
-                            games_played: 0,
-                            wins: 0,
-                            decided_matches: 0,
-                            latest_elo: None,
-                            latest_elo_date: None,
-                        });
-                    player.games_played = player.games_played.checked_add(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "games played overflow")
-                    })?;
-                    if has_winner {
-                        player.decided_matches =
-                            player.decided_matches.checked_add(1).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "decided match count overflow",
-                                )
-                            })?;
-                        if won {
-                            player.wins = player.wins.checked_add(1).ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::InvalidData, "win count overflow")
-                            })?;
-                        }
-                    }
-                    if let Some(elo) = participant.elo
-                        && player
-                            .latest_elo_date
-                            .is_none_or(|latest_date| date >= latest_date)
+            let chunks: Result<Vec<_>, io::Error> = (0..reader.num_row_groups())
+                .into_par_iter()
+                .filter(|&index| row_group_matches(&reader, index, seasons))
+                .map(|index| {
+                    // File-backed Parquet readers share a seek cursor across clones.
+                    // Give each worker its own file descriptor for concurrent reads.
+                    let worker_reader =
+                        open(path).map_err(|error| io::Error::other(error.to_string()))?;
+                    let row_group = worker_reader
+                        .get_row_group(index)
+                        .map_err(io::Error::other)?;
+                    let mut chunk = PlayerSeasonsChunk::default();
+                    for row in row_group
+                        .get_row_iter(Some(projection.clone()))
+                        .map_err(io::Error::other)?
                     {
-                        player.latest_elo = Some(elo);
-                        player.latest_elo_date = Some(date);
+                        chunk.add_row(&row.map_err(io::Error::other)?, seasons, keep_history)?;
                     }
-                    season_history
-                        .players
-                        .entry(participant.uuid)
-                        .or_default()
-                        .push(TemporalEvent {
-                            date,
-                            match_id,
-                            elo: participant.elo,
-                            won,
-                            decided: has_winner,
-                        });
-                }
+                    Ok(chunk)
+                })
+                .collect();
+            for chunk in chunks? {
+                combined.merge(chunk)?;
             }
         }
 
-        if players.is_empty() {
+        if combined.players.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "no player records found in selected files",
@@ -342,8 +494,8 @@ impl PlayerSeasons {
         }
 
         Ok(Self {
-            players: players.into_values().collect(),
-            history_by_season,
+            players: combined.players.into_values().collect(),
+            history_by_season: combined.history_by_season,
         })
     }
 
