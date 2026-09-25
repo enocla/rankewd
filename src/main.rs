@@ -1,6 +1,6 @@
 mod analysis;
 
-use analysis::SeasonFile;
+use analysis::DatasetFile;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, Box<dyn Error>> {
-    let mut dataset = PathBuf::from("dataset");
+    let mut dataset = PathBuf::from("dataset/seasons_10_11.parquet");
     let mut seasons = DEFAULT_SEASONS.to_vec();
     let mut analysis = String::from("records");
     let mut args = args;
@@ -104,7 +104,32 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
     }))
 }
 
-fn find_season_files(dataset: &Path, seasons: &[u32]) -> Result<Vec<SeasonFile>, Box<dyn Error>> {
+fn find_season_files(dataset: &Path, seasons: &[u32]) -> Result<Vec<DatasetFile>, Box<dyn Error>> {
+    if dataset.is_file() {
+        if !is_parquet_file(dataset) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a Parquet file", dataset.display()),
+            )
+            .into());
+        }
+        let label = if dataset.file_name().and_then(|name| name.to_str())
+            == Some("seasons_10_11.parquet")
+        {
+            String::from("Seasons 10 and 11")
+        } else {
+            dataset
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Dataset")
+                .to_owned()
+        };
+        return Ok(vec![DatasetFile {
+            label,
+            path: dataset.to_path_buf(),
+        }]);
+    }
+
     let mut paths = Vec::new();
     collect_parquet_files(dataset, &mut paths)?;
 
@@ -133,8 +158,8 @@ fn find_season_files(dataset: &Path, seasons: &[u32]) -> Result<Vec<SeasonFile>,
             .into());
         }
 
-        files.extend(matching.into_iter().map(|path| SeasonFile {
-            season: *season,
+        files.extend(matching.into_iter().map(|path| DatasetFile {
+            label: format!("Season {season}"),
             path,
         }));
     }
@@ -158,14 +183,19 @@ fn collect_parquet_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), Bo
     Ok(())
 }
 
+fn is_parquet_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+}
+
 fn invalid_arg(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_owned())
 }
 
 fn print_help() {
     println!(
-        "Usage: rankewd [--dataset DIR] [--seasons N[,N...]] [--analysis NAME]\n\
-         Defaults: --dataset dataset --seasons 10,11 --analysis records\n\
+        "Usage: rankewd [--dataset FILE_OR_DIR] [--seasons N[,N...]] [--analysis NAME]\n\
+         Defaults: --dataset dataset/seasons_10_11.parquet --seasons 10,11 --analysis records\n\
          Available analyses: {}",
         analysis::available()
             .iter()
