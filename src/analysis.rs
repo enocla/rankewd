@@ -5,9 +5,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod elo_distribution;
 mod elo_versus_games;
+mod games_per_player;
 mod games_per_week;
 mod records;
+mod sampled_winrate_over_time;
+mod winrate_over_time;
+mod winrate_versus_elo;
 
 /// Directory used for generated artifacts when `--output` is omitted.
 pub const DEFAULT_OUTPUT_DIRECTORY: &str = "output";
@@ -39,22 +44,6 @@ impl OutputLocation {
     pub fn sibling(&self, file_name: &str) -> PathBuf {
         match &self.path {
             Some(path) => output_parent(path).join(file_name),
-            None => Path::new(DEFAULT_OUTPUT_DIRECTORY).join(file_name),
-        }
-    }
-
-    /// Derives a named output from either the default directory or the supplied
-    /// output file's stem.
-    pub fn with_stem(&self, default_stem: &str, extension: &str, suffix: &str) -> PathBuf {
-        let file_name = format!("{default_stem}{suffix}.{extension}");
-        match &self.path {
-            Some(path) => {
-                let stem = path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or(default_stem);
-                output_parent(path).join(format!("{stem}{suffix}.{extension}"))
-            }
             None => Path::new(DEFAULT_OUTPUT_DIRECTORY).join(file_name),
         }
     }
@@ -113,7 +102,8 @@ impl AnalysisReport {
     }
 }
 
-/// An analysis that can be run over selected Parquet datasets.
+/// An analysis that can be run over selected Parquet datasets. Each registered
+/// analysis renders one plot, so `--analysis` also selects which chart is drawn.
 pub trait Analysis {
     /// Concise, stable CLI name.
     fn name(&self) -> &'static str;
@@ -127,7 +117,12 @@ pub fn available() -> Vec<Box<dyn Analysis>> {
     vec![
         Box::new(records::RecordCount),
         Box::new(games_per_week::GamesPerWeek),
+        Box::new(games_per_player::GamesPerPlayer),
         Box::new(elo_versus_games::EloVersusGames),
+        Box::new(elo_distribution::EloDistribution),
+        Box::new(winrate_versus_elo::WinrateVersusElo),
+        Box::new(winrate_over_time::WinrateOverTime),
+        Box::new(sampled_winrate_over_time::SampledWinrateOverTime),
     ]
 }
 

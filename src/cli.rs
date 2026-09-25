@@ -9,7 +9,8 @@ use std::path::PathBuf;
     name = "rankewd",
     version,
     about = "Analyze Rankewd Parquet datasets",
-    after_help = "Available analyses: records, games-per-week, elo-versus-games\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
+    after_help = "Available analyses: records, games-per-week, games-per-player, elo-versus-games, \
+elo-distribution, winrate-versus-elo, winrate-over-time, sampled-winrate-over-time\n\nEach analysis runs on its own; the plot analyses write one PNG per season.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
 )]
 struct Cli {
     /// Parquet file or directory to analyze.
@@ -29,12 +30,12 @@ struct Cli {
     )]
     seasons: SeasonSelection,
 
-    /// Analysis to run.
+    /// Analysis to run. Each plot has its own analysis name.
     #[arg(long, value_name = "NAME", default_value = "records")]
     analysis: String,
 
-    /// Output file for a single-output analysis, or an output base for
-    /// multi-file analyses.
+    /// Output file for a single-output analysis, or the output directory for
+    /// per-season analyses.
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 }

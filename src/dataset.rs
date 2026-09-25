@@ -1,13 +1,41 @@
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Field, List, Row};
 use parquet::schema::parser::parse_message_type;
-use std::collections::BTreeSet;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
 pub(crate) type ParquetFile = SerializedFileReader<File>;
+
+/// Lowest match count before a player's win rate is stable enough to chart.
+pub(crate) const MIN_GAMES_FOR_WINRATE_PLOTS: u64 = 100;
+
+/// Cumulative win-rate snapshots kept for every sampled player.
+pub(crate) const WINRATE_POINTS_PER_PLAYER: usize = 5;
+
+const WINRATE_SAMPLE_SIZE: usize = 100;
+const WINRATE_SAMPLE_SEED: u64 = 0x5241_4e4b_4557_4432;
+const PLAYER_PROJECTION: &str = "message root { \
+    optional int64 id; \
+    optional int64 date; \
+    optional int64 season; \
+    optional group result { \
+        optional binary uuid (STRING); \
+    } \
+    optional group players (LIST) { \
+        repeated group list { \
+            optional group element { \
+                optional binary uuid (STRING); \
+                optional int64 eloRate; \
+            } \
+        } \
+    } \
+}";
 
 pub(crate) fn open(path: &Path) -> Result<ParquetFile, Box<dyn Error>> {
     Ok(SerializedFileReader::new(File::open(path)?)?)
@@ -104,4 +132,472 @@ pub(crate) fn invalid_field(name: &str, value: &Field) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("unexpected value for {name}: {value:?}"),
     )
+}
+
+/// Player rows and per-season match history read from the selected datasets.
+pub(crate) struct PlayerSeasons {
+    players: Vec<PlayerSeason>,
+    history_by_season: BTreeMap<u32, SeasonHistory>,
+}
+
+/// Everything one season's plots need: its players and their match history.
+pub(crate) struct SeasonData<'a> {
+    pub(crate) season: u32,
+    pub(crate) players: Vec<&'a PlayerSeason>,
+    pub(crate) history: &'a SeasonHistory,
+}
+
+/// One player's season totals and most recent Elo rating.
+pub(crate) struct PlayerSeason {
+    pub(crate) season: u32,
+    pub(crate) uuid: String,
+    pub(crate) games_played: u64,
+    pub(crate) latest_elo: Option<i64>,
+    wins: u64,
+    decided_matches: u64,
+    latest_elo_date: Option<i64>,
+}
+
+/// One player's participation in a single match.
+struct Participant {
+    uuid: String,
+    elo: Option<i64>,
+}
+
+#[derive(Default)]
+pub(crate) struct SeasonHistory {
+    players: HashMap<String, Vec<TemporalEvent>>,
+    first_date: Option<i64>,
+    last_date: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+struct TemporalEvent {
+    date: i64,
+    match_id: i64,
+    elo: Option<i64>,
+    won: bool,
+    decided: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TemporalPoint {
+    pub(crate) elo: i64,
+    pub(crate) win_rate: f64,
+    pub(crate) progress: f64,
+}
+
+#[derive(Default)]
+pub(crate) struct SampledTemporalPoints {
+    pub(crate) player_count: usize,
+    pub(crate) points: Vec<TemporalPoint>,
+}
+
+#[derive(Clone, Copy)]
+struct TemporalCandidate {
+    date: i64,
+    elo: i64,
+    win_rate: f64,
+}
+
+impl PlayerSeason {
+    pub(crate) fn win_rate(&self) -> Option<f64> {
+        (self.decided_matches > 0).then(|| self.wins as f64 / self.decided_matches as f64)
+    }
+}
+
+impl PlayerSeasons {
+    /// Reads player totals and match history for every requested season.
+    pub(crate) fn load<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        seasons: Option<&[u32]>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut players = BTreeMap::<(u32, String), PlayerSeason>::new();
+        let mut history_by_season = BTreeMap::<u32, SeasonHistory>::new();
+
+        for path in paths {
+            let reader = open(path)?;
+            let projection = parse_message_type(PLAYER_PROJECTION)?;
+
+            for row in reader.get_row_iter(Some(projection.clone()))? {
+                let row = row?;
+                let season = integer_field(&row, "season")?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
+                let season = u32::try_from(season).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
+                })?;
+                if seasons.is_some_and(|requested| !requested.contains(&season)) {
+                    continue;
+                }
+
+                let date = integer_field(&row, "date")?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing match date")
+                })?;
+                let match_id = integer_field(&row, "id")?.unwrap_or_default();
+                let season_history = history_by_season.entry(season).or_default();
+                season_history.first_date = Some(
+                    season_history
+                        .first_date
+                        .map_or(date, |first_date| first_date.min(date)),
+                );
+                season_history.last_date = Some(
+                    season_history
+                        .last_date
+                        .map_or(date, |last_date| last_date.max(date)),
+                );
+
+                let Some(participants) = list_field(&row, "players")? else {
+                    continue;
+                };
+                let winner_uuid = group_field(&row, "result")?
+                    .map(|result| string_field(result, "uuid"))
+                    .transpose()?
+                    .flatten();
+                let mut match_participants = Vec::new();
+                let mut seen_in_match = HashSet::new();
+
+                for participant in participants.elements() {
+                    let Field::Group(participant) = participant else {
+                        return Err(invalid_field("player entry", participant).into());
+                    };
+                    let Some(uuid) = string_field(participant, "uuid")? else {
+                        continue;
+                    };
+                    if !seen_in_match.insert(uuid.to_owned()) {
+                        continue;
+                    }
+
+                    match_participants.push(Participant {
+                        uuid: uuid.to_owned(),
+                        elo: integer_field(participant, "eloRate")?,
+                    });
+                }
+                let has_winner = winner_uuid.as_ref().is_some_and(|winner| {
+                    match_participants
+                        .iter()
+                        .any(|participant| &participant.uuid == winner)
+                });
+
+                for participant in match_participants {
+                    let won = winner_uuid
+                        .as_ref()
+                        .is_some_and(|winner| winner == &participant.uuid);
+                    let player = players
+                        .entry((season, participant.uuid.clone()))
+                        .or_insert_with(|| PlayerSeason {
+                            season,
+                            uuid: participant.uuid.clone(),
+                            games_played: 0,
+                            wins: 0,
+                            decided_matches: 0,
+                            latest_elo: None,
+                            latest_elo_date: None,
+                        });
+                    player.games_played = player.games_played.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "games played overflow")
+                    })?;
+                    if has_winner {
+                        player.decided_matches =
+                            player.decided_matches.checked_add(1).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "decided match count overflow",
+                                )
+                            })?;
+                        if won {
+                            player.wins = player.wins.checked_add(1).ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::InvalidData, "win count overflow")
+                            })?;
+                        }
+                    }
+                    if let Some(elo) = participant.elo
+                        && player
+                            .latest_elo_date
+                            .is_none_or(|latest_date| date >= latest_date)
+                    {
+                        player.latest_elo = Some(elo);
+                        player.latest_elo_date = Some(date);
+                    }
+                    season_history
+                        .players
+                        .entry(participant.uuid)
+                        .or_default()
+                        .push(TemporalEvent {
+                            date,
+                            match_id,
+                            elo: participant.elo,
+                            won,
+                            decided: has_winner,
+                        });
+                }
+            }
+        }
+
+        if players.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no player records found in selected files",
+            )
+            .into());
+        }
+
+        Ok(Self {
+            players: players.into_values().collect(),
+            history_by_season,
+        })
+    }
+
+    /// Groups every player by season and pairs each group with its history.
+    pub(crate) fn all_player_seasons(&self) -> Vec<SeasonData<'_>> {
+        let mut by_season = BTreeMap::<u32, Vec<&PlayerSeason>>::new();
+        for player in &self.players {
+            by_season.entry(player.season).or_default().push(player);
+        }
+
+        by_season
+            .into_iter()
+            .map(|(season, players)| SeasonData {
+                season,
+                players,
+                history: &self.history_by_season[&season],
+            })
+            .collect()
+    }
+
+    /// Groups rated players by season and pairs each group with its history.
+    pub(crate) fn seasons(&self) -> Result<Vec<SeasonData<'_>>, Box<dyn Error>> {
+        let mut by_season = BTreeMap::<u32, Vec<&PlayerSeason>>::new();
+        for player in &self.players {
+            if player.latest_elo.is_some() {
+                by_season.entry(player.season).or_default().push(player);
+            }
+        }
+        if by_season.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no players had an Elo value in the selected files",
+            )
+            .into());
+        }
+
+        Ok(by_season
+            .into_iter()
+            .map(|(season, players)| SeasonData {
+                season,
+                players,
+                history: &self.history_by_season[&season],
+            })
+            .collect())
+    }
+}
+
+impl SeasonHistory {
+    /// Season start, season end, and length in seconds.
+    fn timeline(&self) -> Result<(i64, i64, f64), Box<dyn Error>> {
+        let first_date = self.first_date.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "season history has no dates")
+        })?;
+        let last_date = self.last_date.unwrap_or(first_date);
+        let duration = last_date.saturating_sub(first_date).max(1) as f64;
+        Ok((first_date, last_date, duration))
+    }
+
+    /// Cumulative win rate at every rated, decided match of the given players.
+    pub(crate) fn points(
+        &self,
+        eligible_uuids: &HashSet<String>,
+    ) -> Result<Vec<TemporalPoint>, Box<dyn Error>> {
+        let (first_date, _, duration) = self.timeline()?;
+        let mut points = Vec::new();
+
+        for (uuid, events) in &self.players {
+            if !eligible_uuids.contains(uuid.as_str()) {
+                continue;
+            }
+            points.extend(
+                temporal_candidates(events)
+                    .into_iter()
+                    .map(|candidate| TemporalPoint {
+                        elo: candidate.elo,
+                        win_rate: candidate.win_rate,
+                        progress: progress_of(candidate.date, first_date, duration),
+                    }),
+            );
+        }
+
+        Ok(points)
+    }
+
+    /// Evenly spaced cumulative win-rate snapshots for a reproducible sample of
+    /// the given players.
+    pub(crate) fn sample_points(
+        &self,
+        eligible_uuids: &HashSet<String>,
+        season: u32,
+    ) -> Result<SampledTemporalPoints, Box<dyn Error>> {
+        let (first_date, last_date, duration) = self.timeline()?;
+        let mut eligible: Vec<_> = self
+            .players
+            .iter()
+            .filter(|(uuid, events)| {
+                eligible_uuids.contains(uuid.as_str())
+                    && events
+                        .iter()
+                        .filter(|event| event.decided && event.elo.is_some())
+                        .count()
+                        >= WINRATE_POINTS_PER_PLAYER
+            })
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        eligible.sort_unstable();
+
+        let mut rng = StdRng::seed_from_u64(WINRATE_SAMPLE_SEED ^ u64::from(season));
+        eligible.shuffle(&mut rng);
+        eligible.truncate(WINRATE_SAMPLE_SIZE);
+
+        let mut sampled = SampledTemporalPoints {
+            player_count: eligible.len(),
+            points: Vec::with_capacity(eligible.len().saturating_mul(WINRATE_POINTS_PER_PLAYER)),
+        };
+        for uuid in eligible {
+            let events = self.players.get(&uuid).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing player history")
+            })?;
+            let candidates = temporal_candidates(events);
+            for candidate in select_evenly_spaced(&candidates, first_date, last_date) {
+                sampled.points.push(TemporalPoint {
+                    elo: candidate.elo,
+                    win_rate: candidate.win_rate,
+                    progress: progress_of(candidate.date, first_date, duration),
+                });
+            }
+        }
+
+        Ok(sampled)
+    }
+}
+
+fn progress_of(date: i64, first_date: i64, duration: f64) -> f64 {
+    ((date.saturating_sub(first_date) as f64) / duration).clamp(0.0, 1.0)
+}
+
+fn temporal_candidates(events: &[TemporalEvent]) -> Vec<TemporalCandidate> {
+    let mut events = events.to_vec();
+    events.sort_unstable_by_key(|event| (event.date, event.match_id));
+    let mut candidates = Vec::new();
+    let mut wins = 0u64;
+    let mut decided_matches = 0u64;
+    for event in events {
+        if event.decided {
+            decided_matches += 1;
+            if event.won {
+                wins += 1;
+            }
+        }
+        if let Some(elo) = event.elo
+            && decided_matches > 0
+        {
+            candidates.push(TemporalCandidate {
+                date: event.date,
+                elo,
+                win_rate: wins as f64 / decided_matches as f64,
+            });
+        }
+    }
+    candidates
+}
+
+fn select_evenly_spaced(
+    candidates: &[TemporalCandidate],
+    first_date: i64,
+    last_date: i64,
+) -> Vec<TemporalCandidate> {
+    if candidates.len() < WINRATE_POINTS_PER_PLAYER {
+        return Vec::new();
+    }
+
+    let duration = last_date.saturating_sub(first_date).max(1);
+    let interval_count = (WINRATE_POINTS_PER_PLAYER - 1) as i64;
+    let target_dates: Vec<_> = (0..WINRATE_POINTS_PER_PLAYER)
+        .map(|index| {
+            first_date.saturating_add(duration.saturating_mul(index as i64) / interval_count)
+        })
+        .collect();
+    let candidate_count = candidates.len();
+    let mut costs = vec![vec![f64::INFINITY; candidate_count]; WINRATE_POINTS_PER_PLAYER];
+    let mut previous = vec![vec![None; candidate_count]; WINRATE_POINTS_PER_PLAYER];
+
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        costs[0][candidate_index] = candidate.date.abs_diff(target_dates[0]) as f64;
+    }
+    for target_index in 1..WINRATE_POINTS_PER_PLAYER {
+        for candidate_index in target_index..candidate_count {
+            for previous_index in target_index - 1..candidate_index {
+                let prior_cost = costs[target_index - 1][previous_index];
+                if !prior_cost.is_finite() {
+                    continue;
+                }
+                let distance = candidates[candidate_index]
+                    .date
+                    .abs_diff(target_dates[target_index]) as f64;
+                let cost = prior_cost + distance;
+                if cost < costs[target_index][candidate_index] {
+                    costs[target_index][candidate_index] = cost;
+                    previous[target_index][candidate_index] = Some(previous_index);
+                }
+            }
+        }
+    }
+
+    let Some((mut candidate_index, _)) = costs[WINRATE_POINTS_PER_PLAYER - 1]
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .filter(|(_, cost)| cost.is_finite())
+    else {
+        return Vec::new();
+    };
+    let mut selected = Vec::with_capacity(WINRATE_POINTS_PER_PLAYER);
+    for target_index in (0..WINRATE_POINTS_PER_PLAYER).rev() {
+        selected.push(candidates[candidate_index]);
+        if target_index > 0 {
+            candidate_index = previous[target_index][candidate_index]
+                .expect("a finite assignment has a preceding candidate");
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+/// Players whose win rate is based on enough decided matches to chart.
+pub(crate) fn eligible_winrate_players<'a>(players: &[&'a PlayerSeason]) -> Vec<&'a PlayerSeason> {
+    players
+        .iter()
+        .copied()
+        .filter(|player| {
+            player.games_played >= MIN_GAMES_FOR_WINRATE_PLOTS && player.win_rate().is_some()
+        })
+        .collect()
+}
+
+/// UUIDs of the players whose win rate is based on enough decided matches.
+pub(crate) fn eligible_winrate_uuids(players: &[&PlayerSeason]) -> HashSet<String> {
+    eligible_winrate_players(players)
+        .into_iter()
+        .map(|player| player.uuid.clone())
+        .collect()
+}
+
+/// Inclusive Elo range covering every supplied value.
+pub(crate) fn elo_range(
+    values: impl IntoIterator<Item = i64>,
+) -> Result<(i64, i64), Box<dyn Error>> {
+    let mut bounds: Option<(i64, i64)> = None;
+    for value in values {
+        bounds = Some(match bounds {
+            Some((min, max)) => (min.min(value), max.max(value)),
+            None => (value, value),
+        });
+    }
+    bounds.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no Elo values to plot").into())
 }

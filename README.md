@@ -11,11 +11,18 @@ the source-record schema exposed by [`rankewd::schema`](src/schema.rs).
   definition and application orchestration.
 - `src/analysis.rs` contains the analysis contract, registry, input model, and
   output policy.
-- `src/analysis/records.rs`, `games_per_week.rs`, and
-  `elo_versus_games.rs` are the complete implementations for the registered
-  analysis types. Analysis-specific code stays in those files.
-- `src/dataset.rs` is the shared Parquet access boundary.
-- `src/plot.rs` is the shared chart theme and filesystem helper.
+- Every plot has its own file under `src/analysis/` and its own
+  `--analysis` name: `records.rs` (`records`), `games_per_week.rs`
+  (`games-per-week`), `games_per_player.rs` (`games-per-player`),
+  `elo_versus_games.rs` (`elo-versus-games`), `elo_distribution.rs`
+  (`elo-distribution`), `winrate_versus_elo.rs`
+  (`winrate-versus-elo`), `winrate_over_time.rs` (`winrate-over-time`), and
+  `sampled_winrate_over_time.rs` (`sampled-winrate-over-time`).
+  Analysis-specific code stays in those files.
+- `src/dataset.rs` is the shared Parquet access boundary, including the player
+  and match-history aggregation shared by the player analyses.
+- `src/plot.rs` is the shared chart theme, axis helpers, and reusable legend
+  components.
 - `dataset/` is ignored local input data.
 - `output/` is the default location for all generated artifacts and is ignored by Git.
 - `docs/` documents the data contract and architecture.
@@ -64,7 +71,15 @@ Run an analysis and keep generated files in the default `output/` directory:
 cargo run -- --dataset dataset --seasons all --analysis elo-versus-games
 ```
 
-For a single-output analysis, `--output` is the exact PNG path. For
-`elo-versus-games`, it is an output base: the parent directory receives the
-per-season charts and `player_elos.parquet`, while the supplied stem is used
-for the primary Elo-versus-games chart.
+Each plot is selected by its own `--analysis` value, for example
+`--analysis games-per-player`, `--analysis elo-distribution`,
+`--analysis winrate-versus-elo`, `--analysis winrate-over-time`, or
+`--analysis sampled-winrate-over-time`. The
+last one plots a reproducible random sample of up to 100 eligible players, with
+five cumulative win-rate snapshots selected nearest the start, quarter,
+midpoint, three-quarter, and end of each season.
+
+For `games-per-week`, which writes a single chart, `--output` is the exact PNG
+path. The per-season analyses write one PNG per season into the directory that
+holds `--output`, keeping the documented file names such as
+`elo_vs_games_season_11.png`.
