@@ -19,6 +19,7 @@
               cargo
               rustc
               rustfmt
+              clippy
               pkg-config
               fontconfig
               fontconfig.dev

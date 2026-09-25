@@ -1,5 +1,7 @@
-//! Typed Rust representation of one match record in the season JSONL files.
+//! Typed Rust representation of one match record in the source JSONL export.
 //!
+//! The runtime analyses consume Parquet projections, while this module remains
+//! the public compatibility model for consumers of the original source data.
 //! The structs use Serde's camel-case mapping to match the source field names.
 //! Source codes that do not have a documented mapping remain integers or
 //! strings. Optional fields capture historical omissions and nullable values.

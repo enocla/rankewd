@@ -1,10 +1,15 @@
-# Season dataset format
+# Match dataset format
 
-The files in `dataset/` are JSON Lines: each non-empty line is one JSON object for a match, rather than one JSON array containing all matches. The Rust data model is in [`src/schema.rs`](../src/schema.rs) and is exported as `rankewd::schema`.
+Parquet is the runtime format consumed by the CLI and analyses. The original
+source export is JSON Lines: each non-empty line is one JSON object for a
+match. The source interchange model remains in [`src/schema.rs`](../src/schema.rs)
+and is exported as `rankewd::schema`; analyses use small Parquet projections
+because they do not need every field in the full source record.
 
-## Reading a record
+## Reading a source record
 
-The crate exposes Serde types, so a consumer can deserialize each line with `serde_json`:
+The crate exposes Serde types, so a consumer can deserialize a JSON Lines
+record with `serde_json`:
 
 ```rust
 use rankewd::schema::MatchRecord;
@@ -49,11 +54,11 @@ The model uses `Option<T>` for nullable values and fields that are absent in old
 - Match, result, completion, and timeline times are milliseconds. The `date` field is Unix seconds.
 - `NetherLocation` represents the observed `BRIDGE`, `HOUSING`, `STABLES`, and `TREASURE` labels. The category, seed, game-mode, match-type, event-type, and player-role values otherwise remain open strings or source integers because the export does not provide complete mappings.
 - Country values are lowercase two-letter strings when present, but are preserved as supplied and may include non-standard codes.
-- The model was based on records sampled at several positions in each of the ten available season files. Update the types if future exports introduce confirmed fields or value variants.
+- The model was based on records sampled at several positions in the available season files. Update the types if future exports introduce confirmed fields or value variants.
 
 ## Player-season summary data
 
-Run `rankewd --analysis elo-versus-games` to aggregate match files by season and player UUID. By default, this analysis reads all files named `season_N_*.parquet` in `dataset/`; `--seasons` can limit the selection. Elo and games played are kept separate for each season, since seasonal ratings reset. Win counting treats `result.uuid` as the winner and counts a match as decided only when that UUID appears in the participant list. The analysis writes `dataset/player_elos.parquet` with one row per player per season and these columns:
+Run `rankewd --analysis elo-versus-games` to aggregate match files by season and player UUID. By default, the CLI uses `dataset/seasons_10_11.parquet` but filters it to season 11; use `--dataset dataset --seasons all` to select every `season_N_*.parquet` file. Elo and games played are kept separate for each season, since seasonal ratings reset. Win counting treats `result.uuid` as the winner and counts a match as decided only when that UUID appears in the participant list. The analysis writes `output/player_elos.parquet` with one row per player per season and these columns:
 
 | Column | Type | Meaning |
 | --- | --- | --- |
@@ -67,4 +72,4 @@ Run `rankewd --analysis elo-versus-games` to aggregate match files by season and
 | `latest_elo` | nullable `int64` | Latest non-null Elo recorded for that player in that season. |
 | `latest_elo_date` | nullable `int64` | Unix seconds timestamp for that Elo observation. |
 
-The analysis writes `elo_vs_games_season_N.png` and `elo_distribution_season_N.png` for each season containing a rated player. The Elo distribution chart uses 50 point bins. The two win-rate charts are written for seasons with qualifying data and are limited to player-season rows with at least 100 match appearances. `winrate_vs_elo_season_N.png` shows player rates and a mean player rate line for 100 Elo bins with at least 20 players. `winrate_over_time_season_N.png` plots each qualifying player's match-time Elo against their cumulative win rate through that match; a smooth color gradient shows progress from the first to last match date in the season. The Parquet table retains all players regardless of these chart filters. Matches without a recorded winner are excluded from win-rate denominators and do not update cumulative rates. When `--output PATH` is supplied, its filename stem is used for the Elo-versus-games charts, with the season appended; the other charts use their standard names in the same directory.
+The analysis writes `elo_vs_games_season_N.png` and `elo_distribution_season_N.png` for each season containing a rated player. The Elo distribution chart uses 50 point bins. The two win-rate charts are written for seasons with qualifying data and are limited to player-season rows with at least 100 match appearances. `winrate_vs_elo_season_N.png` shows player rates and a mean player rate line for 100 Elo bins with at least 20 players. `winrate_over_time_season_N.png` plots each qualifying player's match-time Elo against their cumulative win rate through that match; a smooth color gradient shows progress from the first to last match date in the season. The Parquet table retains all players regardless of these chart filters. Matches without a recorded winner are excluded from win-rate denominators and do not update cumulative rates. When `--output PATH` is supplied, its parent becomes the output directory, its stem is used for the primary Elo-versus-games chart, and the other artifacts use their standard names. Existing files are not removed when a season no longer qualifies.
