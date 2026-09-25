@@ -2,16 +2,6 @@
 
 The files in `dataset/` are JSON Lines: each non-empty line is one JSON object for a match, rather than one JSON array containing all matches. The Rust data model is in [`src/schema.rs`](../src/schema.rs) and is exported as `rankewd::schema`.
 
-## Convert all seasons to Parquet
-
-Run `cargo run --release --bin dataset_to_parquet`. It reads every `*.jsonl` file directly inside `dataset/`, writes one Parquet file per season into `dataset/parquet/`, and reports Polars row counts for each output and the total. Optional positional arguments override the input and output directories:
-
-```sh
-cargo run --release --bin dataset_to_parquet -- dataset /path/to/parquet
-```
-
-The converter uses Polars' lazy JSON Lines reader and Parquet sink to process each season without collecting the full dataset into memory. It infers each file's schema from all rows so sparse fields are included.
-
 ## Reading a record
 
 The crate exposes Serde types, so a consumer can deserialize each line with `serde_json`:
