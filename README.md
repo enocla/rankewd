@@ -18,9 +18,9 @@ and forfeited matches by default.
   (`games-per-week`), `games_per_player.rs` (`games-per-player`),
   `rolling_win_duration.rs` (`rolling-win-duration`),
   `elo_versus_games.rs` (`elo-versus-games`), `elo_distribution.rs`
-  (`elo-distribution`), `name_length_versus_elo.rs`
-  (`name-length-versus-elo`), `elo_versus_win_duration.rs`
-  (`elo-versus-win-duration`), `winrate_versus_elo.rs`
+  (`elo-distribution`), `elo_versus_win_duration.rs`
+  (`elo-versus-win-duration`), `name_underscores_versus_elo.rs`
+  (`name-underscores-versus-elo`), `winrate_versus_elo.rs`
   (`winrate-versus-elo`), `winrate_over_time.rs` (`winrate-over-time`), and
   `sampled_winrate_over_time.rs` (`sampled-winrate-over-time`).
   Analysis-specific code stays in those files.
@@ -85,12 +85,13 @@ the mean player trend.
 `--analysis sampled-winrate-over-time` plots a reproducible random sample of up
 to 100 eligible players, with five cumulative win-rate snapshots selected
 nearest the start, quarter, midpoint, three-quarter, and end of each season.
-`--analysis name-length-versus-elo` scatters every rated player by the character
-count of the name they used at their final rating and that rating, and prints the
-Pearson correlation between the two. `--analysis elo-versus-win-duration`
-scatters rated players by their final Elo and the mean duration in seconds of
-their type-2 wins, and prints the Pearson correlation of the two. Both report
-their R value in the chart title as well as in the CLI report.
+`--analysis elo-versus-win-duration` scatters rated players by their final Elo
+and the mean duration in seconds of their type-2 wins, and prints the Pearson
+correlation of the two. `--analysis name-underscores-versus-elo` draws a box
+plot of final Elo grouped by how many underscores the player's name held at
+their final rating, and reports each group's size, median, and outlier count.
+Both plot analyses report their key numbers in the chart title as well as in the
+CLI report.
 
 For `games-per-week`, which writes a single chart, `--output` is the exact PNG
 path. The per-season analyses write one PNG per season into the directory that

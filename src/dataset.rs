@@ -201,7 +201,7 @@ pub(crate) struct PlayerSeason {
     pub(crate) uuid: String,
     pub(crate) games_played: u64,
     pub(crate) latest_elo: Option<i64>,
-    pub(crate) latest_name_length: Option<usize>,
+    pub(crate) latest_underscore_count: Option<usize>,
     wins: u64,
     decided_matches: u64,
     latest_elo_date: Option<i64>,
@@ -211,7 +211,7 @@ pub(crate) struct PlayerSeason {
 struct Participant {
     uuid: String,
     elo: Option<i64>,
-    name_length: Option<usize>,
+    underscore_count: Option<usize>,
 }
 
 #[derive(Default)]
@@ -369,8 +369,8 @@ impl PlayerSeasonsChunk {
             match_participants.push(Participant {
                 uuid: uuid.to_owned(),
                 elo: integer_field(participant, "eloRate")?,
-                name_length: string_field(participant, "nickname")?
-                    .map(|name| name.chars().count()),
+                underscore_count: string_field(participant, "nickname")?
+                    .map(|name| name.chars().filter(|character| *character == '_').count()),
             });
         }
         let has_winner = winner_uuid.as_ref().is_some_and(|winner| {
@@ -393,7 +393,7 @@ impl PlayerSeasonsChunk {
                     wins: 0,
                     decided_matches: 0,
                     latest_elo: None,
-                    latest_name_length: None,
+                    latest_underscore_count: None,
                     latest_elo_date: None,
                 });
             player.games_played = player.games_played.checked_add(1).ok_or_else(|| {
@@ -417,7 +417,7 @@ impl PlayerSeasonsChunk {
             {
                 player.latest_elo = Some(elo);
                 player.latest_elo_date = Some(date);
-                player.latest_name_length = participant.name_length;
+                player.latest_underscore_count = participant.underscore_count;
             }
             if keep_history {
                 season_history
@@ -463,7 +463,7 @@ impl PlayerSeasonsChunk {
                 {
                     player.latest_elo = incoming.latest_elo;
                     player.latest_elo_date = Some(date);
-                    player.latest_name_length = incoming.latest_name_length;
+                    player.latest_underscore_count = incoming.latest_underscore_count;
                 }
             } else {
                 self.players.insert(key, incoming);

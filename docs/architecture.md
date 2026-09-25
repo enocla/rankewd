@@ -31,10 +31,10 @@ selects which chart is drawn:
   for type-2, non-decayed, non-forfeited wins over season progress.
 - `elo_versus_games.rs` charts latest Elo against games played.
 - `elo_distribution.rs` bins rated players by latest Elo.
-- `name_length_versus_elo.rs` charts the character count of each rated player's
-  name against their final Elo and reports the Pearson correlation.
 - `elo_versus_win_duration.rs` charts each rated player's final Elo against the
   mean duration of their wins and reports the Pearson correlation.
+- `name_underscores_versus_elo.rs` charts a box plot of final Elo per underscore
+  count in the player's name.
 - `winrate_versus_elo.rs` charts player win rate against latest Elo.
 - `winrate_over_time.rs` charts cumulative win rate at every rated, decided
   match.
