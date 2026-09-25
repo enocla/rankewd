@@ -2,7 +2,9 @@
 
 `rankewd` reads Rankewd Parquet match data and runs focused analyses over the
 selected seasons. It is both a small command-line application and a library for
-the source-record schema exposed by [`rankewd::schema`](src/schema.rs).
+the source-record schema exposed by [`rankewd::schema`](src/schema.rs). Curated
+datasets contain only `type = 2` matches, and every analysis excludes decayed
+and forfeited matches by default.
 
 ## Repository layout
 
@@ -14,8 +16,11 @@ the source-record schema exposed by [`rankewd::schema`](src/schema.rs).
 - Every plot has its own file under `src/analysis/` and its own
   `--analysis` name: `records.rs` (`records`), `games_per_week.rs`
   (`games-per-week`), `games_per_player.rs` (`games-per-player`),
+  `rolling_win_duration.rs` (`rolling-win-duration`),
   `elo_versus_games.rs` (`elo-versus-games`), `elo_distribution.rs`
-  (`elo-distribution`), `winrate_versus_elo.rs`
+  (`elo-distribution`), `name_length_versus_elo.rs`
+  (`name-length-versus-elo`), `elo_versus_win_duration.rs`
+  (`elo-versus-win-duration`), `winrate_versus_elo.rs`
   (`winrate-versus-elo`), `winrate_over_time.rs` (`winrate-over-time`), and
   `sampled_winrate_over_time.rs` (`sampled-winrate-over-time`).
   Analysis-specific code stays in those files.
@@ -71,13 +76,21 @@ Run an analysis and keep generated files in the default `output/` directory:
 cargo run -- --dataset dataset --seasons all --analysis elo-versus-games
 ```
 
-Each plot is selected by its own `--analysis` value, for example
-`--analysis games-per-player`, `--analysis elo-distribution`,
-`--analysis winrate-versus-elo`, `--analysis winrate-over-time`, or
-`--analysis sampled-winrate-over-time`. The
-last one plots a reproducible random sample of up to 100 eligible players, with
-five cumulative win-rate snapshots selected nearest the start, quarter,
-midpoint, three-quarter, and end of each season.
+Each plot is selected by its own `--analysis` value. For example,
+`--analysis rolling-win-duration` plots one line per player with more than 100
+games, aligned by season progress, with the mean duration of that player's ten
+most recent type-2, non-decayed, non-forfeited wins in seconds. Lower values
+indicate improvement; the chart uses a logarithmic duration axis and overlays
+the mean player trend.
+`--analysis sampled-winrate-over-time` plots a reproducible random sample of up
+to 100 eligible players, with five cumulative win-rate snapshots selected
+nearest the start, quarter, midpoint, three-quarter, and end of each season.
+`--analysis name-length-versus-elo` scatters every rated player by the character
+count of the name they used at their final rating and that rating, and prints the
+Pearson correlation between the two. `--analysis elo-versus-win-duration`
+scatters rated players by their final Elo and the mean duration in seconds of
+their type-2 wins, and prints the Pearson correlation of the two. Both report
+their R value in the chart title as well as in the CLI report.
 
 For `games-per-week`, which writes a single chart, `--output` is the exact PNG
 path. The per-season analyses write one PNG per season into the directory that

@@ -12,6 +12,8 @@
 ## Defaults and outputs
 
 - Use `dataset/seasons_10_11.parquet` as the stable default input and filter the default analysis scope to season 11.
+- Keep curated Parquet data limited to `type = 2`; remove rows of every other match type from the data files.
+- Filter every analysis to `decayed = false` and `forfeited = false` by default. Only rows with both values false may contribute to records, aggregates, or plots.
 - Put every generated artifact under `output/` by default; never write runtime output to the repository root or `dataset/`.
 - Keep `output/` ignored and do not commit generated PNG artifacts.
 - Treat `--output` as an explicit relocation of the complete output family: the exact path for single-output analyses, the containing directory for per-season analyses.

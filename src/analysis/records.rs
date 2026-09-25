@@ -12,12 +12,9 @@ impl Analysis for RecordCount {
     fn run(&self, input: &AnalysisInput<'_>) -> Result<AnalysisReport, Box<dyn Error>> {
         let mut report = AnalysisReport::default();
         for file in input.files() {
-            let record_count = match input.seasons() {
-                Some(seasons) => dataset::record_count_for_seasons(&file.path, seasons)?,
-                None => dataset::record_count(&file.path)?,
-            };
+            let record_count = dataset::record_count(&file.path, input.seasons())?;
             report.line(format!(
-                "{}: {record_count} records ({})",
+                "{}: {record_count} records after default filters ({})",
                 file.label,
                 file.path.display()
             ));

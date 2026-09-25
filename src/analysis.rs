@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 
 mod elo_distribution;
 mod elo_versus_games;
+mod elo_versus_win_duration;
 mod games_per_player;
 mod games_per_week;
+mod name_length_versus_elo;
 mod records;
+mod rolling_win_duration;
 mod sampled_winrate_over_time;
 mod winrate_over_time;
 mod winrate_versus_elo;
@@ -118,7 +121,10 @@ pub fn available() -> Vec<Box<dyn Analysis>> {
         Box::new(records::RecordCount),
         Box::new(games_per_week::GamesPerWeek),
         Box::new(games_per_player::GamesPerPlayer),
+        Box::new(rolling_win_duration::RollingWinDuration),
         Box::new(elo_versus_games::EloVersusGames),
+        Box::new(name_length_versus_elo::NameLengthVersusElo),
+        Box::new(elo_versus_win_duration::EloVersusWinDuration),
         Box::new(elo_distribution::EloDistribution),
         Box::new(winrate_versus_elo::WinrateVersusElo),
         Box::new(winrate_over_time::WinrateOverTime),

@@ -22,13 +22,19 @@ Each registered analysis has one implementation file directly under
 `src/analysis/`, and every plot has its own analysis so `--analysis` also
 selects which chart is drawn:
 
-- `records.rs` reports Parquet metadata counts.
+- `records.rs` reports row counts after the default match filters.
 - `games_per_week.rs` owns date projection, ISO-week aggregation, and the
   games-per-week chart.
 - `games_per_player.rs` charts games played per player and reports the mean
   and median.
+- `rolling_win_duration.rs` charts each eligible player's ten-win rolling mean
+  for type-2, non-decayed, non-forfeited wins over season progress.
 - `elo_versus_games.rs` charts latest Elo against games played.
 - `elo_distribution.rs` bins rated players by latest Elo.
+- `name_length_versus_elo.rs` charts the character count of each rated player's
+  name against their final Elo and reports the Pearson correlation.
+- `elo_versus_win_duration.rs` charts each rated player's final Elo against the
+  mean duration of their wins and reports the Pearson correlation.
 - `winrate_versus_elo.rs` charts player win rate against latest Elo.
 - `winrate_over_time.rs` charts cumulative win rate at every rated, decided
   match.
@@ -38,7 +44,8 @@ selects which chart is drawn:
 There are no analysis-specific style, utility, or output submodules. Shared
 Parquet concerns, including the player-season and match-history aggregation the
 player analyses read, live in `src/dataset.rs`; shared chart typography, axis
-padding, and legend components live in `src/plot.rs`.
+padding, log key points, the Pearson correlation used by scatter plots, and
+legend components live in `src/plot.rs`.
 
 ## Defaults and outputs
 
@@ -46,6 +53,10 @@ The stable default input is `dataset/seasons_10_11.parquet`, but the default
 season filter is `11`, so every analysis processes only season 11 unless the
 user supplies another selection. This keeps the default input path stable
 without silently analyzing both seasons in the merged file.
+
+Curated Parquet files contain only `type = 2` rows. Independently of that data
+invariant, every analysis applies the default `decayed = false` and
+`forfeited = false` row filters before producing records, aggregates, or plots.
 
 All generated artifacts default to `output/`. The directory is ignored, and
 `--output` relocates the generated charts rather than sending them back into
@@ -59,8 +70,8 @@ All generated artifacts default to `output/`. The directory is ignored, and
 3. `select_files` resolves a file or directory into `DatasetFile` values.
 4. `AnalysisInput` carries the files, optional row-level season filter, and
    output location.
-5. Analyses read through `dataset`, return an `AnalysisReport`, and do not
-   print directly.
+5. Analyses read through `dataset`, which applies the default match filters;
+   analyses return an `AnalysisReport` and do not print directly.
 6. The CLI prints the report.
 
 A season filter is applied to the `season` column even when a single merged

@@ -46,6 +46,58 @@ pub(crate) fn padded_bounds(min: i64, max: i64) -> (i64, i64) {
     (min.saturating_sub(padding), max.saturating_add(padding))
 }
 
+/// Pearson correlation of the x and y series, or `None` when the two series
+/// cannot vary relative to each other.
+pub(crate) fn pearson_r(points: &[(i64, f64)]) -> Option<f64> {
+    if points.len() < 2 {
+        return None;
+    }
+    let count = points.len() as f64;
+    let mean_x = points.iter().map(|(x, _)| *x as f64).sum::<f64>() / count;
+    let mean_y = points.iter().map(|(_, y)| *y).sum::<f64>() / count;
+
+    let mut covariance = 0.0;
+    let mut variance_x = 0.0;
+    let mut variance_y = 0.0;
+    for (x, y) in points {
+        let offset_x = (*x as f64) - mean_x;
+        let offset_y = *y - mean_y;
+        covariance += offset_x * offset_y;
+        variance_x += offset_x * offset_x;
+        variance_y += offset_y * offset_y;
+    }
+
+    let denominator = (variance_x * variance_y).sqrt();
+    (denominator > 0.0).then(|| (covariance / denominator).clamp(-1.0, 1.0))
+}
+
+/// Reports an R value for the CLI report, naming the reason it is missing.
+pub(crate) fn format_correlation(correlation: Option<f64>) -> String {
+    match correlation {
+        Some(value) => format!("{value:.4}"),
+        None => "undefined (neither series varies)".to_owned(),
+    }
+}
+
+/// Ticks to show on a log-scaled axis spanning `y_min` to `y_max`.
+pub(crate) fn log_key_points(y_min: f64, y_max: f64) -> Vec<f64> {
+    let min_exponent = y_min.log10().floor() as i32;
+    let max_exponent = y_max.log10().ceil() as i32;
+    let mut points = Vec::new();
+    for exponent in min_exponent - 1..=max_exponent {
+        for multiplier in [1.0, 2.0, 5.0] {
+            let point = multiplier * 10f64.powi(exponent);
+            if point >= y_min && point <= y_max {
+                points.push(point);
+            }
+        }
+    }
+    if points.is_empty() {
+        points.push(y_min);
+    }
+    points
+}
+
 /// Draws the upper-right legend used by series that carry labels.
 pub(crate) fn draw_series_legend<'a, DB, X, Y>(
     chart: &mut ChartContext<'a, DB, Cartesian2d<X, Y>>,

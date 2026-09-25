@@ -26,7 +26,11 @@ const PLAYER_PROJECTION: &str = "message root { \
     optional int64 id; \
     optional int64 date; \
     optional int64 season; \
+    optional int64 type; \
+    optional boolean decayed; \
+    optional boolean forfeited; \
     optional group result { \
+        optional int64 time; \
         optional binary uuid (STRING); \
     } \
     optional group players (LIST) { \
@@ -34,13 +38,21 @@ const PLAYER_PROJECTION: &str = "message root { \
             optional group element { \
                 optional binary uuid (STRING); \
                 optional int64 eloRate; \
+                optional binary nickname (STRING); \
             } \
         } \
     } \
 }";
+const RECORD_FILTER_PROJECTION: &str = "message root { \
+    optional int64 season; \
+    optional boolean decayed; \
+    optional boolean forfeited; \
+}";
 const PLAYER_SUMMARY_PROJECTION: &str = "message root { \
     optional int64 date; \
     optional int64 season; \
+    optional boolean decayed; \
+    optional boolean forfeited; \
     optional group result { \
         optional binary uuid (STRING); \
     } \
@@ -49,6 +61,7 @@ const PLAYER_SUMMARY_PROJECTION: &str = "message root { \
             optional group element { \
                 optional binary uuid (STRING); \
                 optional int64 eloRate; \
+                optional binary nickname (STRING); \
             } \
         } \
     } \
@@ -58,30 +71,29 @@ pub(crate) fn open(path: &Path) -> Result<ParquetFile, Box<dyn Error>> {
     Ok(SerializedFileReader::new(File::open(path)?)?)
 }
 
-pub(crate) fn record_count(path: &Path) -> Result<i64, Box<dyn Error>> {
-    Ok(open(path)?.metadata().file_metadata().num_rows())
-}
-
-pub(crate) fn record_count_for_seasons(
-    path: &Path,
-    seasons: &[u32],
-) -> Result<i64, Box<dyn Error>> {
-    let requested = seasons.iter().copied().collect::<BTreeSet<_>>();
-    if requested.is_empty() {
+pub(crate) fn record_count(path: &Path, seasons: Option<&[u32]>) -> Result<i64, Box<dyn Error>> {
+    let requested = seasons.map(|seasons| seasons.iter().copied().collect::<BTreeSet<_>>());
+    if requested.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(0);
     }
 
     let reader = open(path)?;
-    let projection = parse_message_type("message root { optional int64 season; }")?;
+    let projection = parse_message_type(RECORD_FILTER_PROJECTION)?;
     let mut count = 0i64;
     for row in reader.get_row_iter(Some(projection))? {
         let row = row?;
+        if !passes_default_filters(&row)? {
+            continue;
+        }
         let season = integer_field(&row, "season")?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season column"))?;
         let season = u32::try_from(season).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
         })?;
-        if requested.contains(&season) {
+        if requested
+            .as_ref()
+            .is_none_or(|requested| requested.contains(&season))
+        {
             count = count
                 .checked_add(1)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "row count overflow"))?;
@@ -99,6 +111,22 @@ pub(crate) fn integer_field(row: &Row, name: &str) -> io::Result<Option<i64>> {
         Some(value) => Err(invalid_field(name, value)),
         None => Err(missing_field(name)),
     }
+}
+
+pub(crate) fn boolean_field(row: &Row, name: &str) -> io::Result<Option<bool>> {
+    let value = find_field(row, name)?;
+    match value {
+        Some(Field::Bool(value)) => Ok(Some(*value)),
+        Some(Field::Null) => Ok(None),
+        Some(value) => Err(invalid_field(name, value)),
+        None => Err(missing_field(name)),
+    }
+}
+
+/// Applies the match filters every analysis uses by default.
+pub(crate) fn passes_default_filters(row: &Row) -> io::Result<bool> {
+    Ok(boolean_field(row, "decayed")? == Some(false)
+        && boolean_field(row, "forfeited")? == Some(false))
 }
 
 pub(crate) fn string_field<'a>(row: &'a Row, name: &str) -> io::Result<Option<&'a str>> {
@@ -173,6 +201,7 @@ pub(crate) struct PlayerSeason {
     pub(crate) uuid: String,
     pub(crate) games_played: u64,
     pub(crate) latest_elo: Option<i64>,
+    pub(crate) latest_name_length: Option<usize>,
     wins: u64,
     decided_matches: u64,
     latest_elo_date: Option<i64>,
@@ -182,6 +211,7 @@ pub(crate) struct PlayerSeason {
 struct Participant {
     uuid: String,
     elo: Option<i64>,
+    name_length: Option<usize>,
 }
 
 #[derive(Default)]
@@ -192,12 +222,14 @@ pub(crate) struct SeasonHistory {
 }
 
 #[derive(Clone, Copy)]
-struct TemporalEvent {
-    date: i64,
-    match_id: i64,
+pub(crate) struct TemporalEvent {
+    pub(crate) date: i64,
+    pub(crate) match_id: i64,
     elo: Option<i64>,
-    won: bool,
+    pub(crate) won: bool,
     decided: bool,
+    pub(crate) match_type: Option<i64>,
+    pub(crate) result_time_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -270,6 +302,10 @@ impl PlayerSeasonsChunk {
         seasons: Option<&[u32]>,
         keep_history: bool,
     ) -> io::Result<()> {
+        if !passes_default_filters(row)? {
+            return Ok(());
+        }
+
         let season = integer_field(row, "season")?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
         let season = u32::try_from(season).map_err(|_| {
@@ -286,6 +322,11 @@ impl PlayerSeasonsChunk {
         } else {
             0
         };
+        let match_type = if keep_history {
+            integer_field(row, "type")?
+        } else {
+            None
+        };
         let season_history = self.history_by_season.entry(season).or_default();
         season_history.first_date = Some(
             season_history
@@ -298,10 +339,19 @@ impl PlayerSeasonsChunk {
         let Some(participants) = list_field(row, "players")? else {
             return Ok(());
         };
-        let winner_uuid = group_field(row, "result")?
+        let result = group_field(row, "result")?;
+        let winner_uuid = result
             .map(|result| string_field(result, "uuid"))
             .transpose()?
             .flatten();
+        let result_time_ms = if keep_history {
+            result
+                .map(|result| integer_field(result, "time"))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         let mut match_participants = Vec::new();
         let mut seen_in_match = HashSet::new();
 
@@ -319,6 +369,8 @@ impl PlayerSeasonsChunk {
             match_participants.push(Participant {
                 uuid: uuid.to_owned(),
                 elo: integer_field(participant, "eloRate")?,
+                name_length: string_field(participant, "nickname")?
+                    .map(|name| name.chars().count()),
             });
         }
         let has_winner = winner_uuid.as_ref().is_some_and(|winner| {
@@ -341,6 +393,7 @@ impl PlayerSeasonsChunk {
                     wins: 0,
                     decided_matches: 0,
                     latest_elo: None,
+                    latest_name_length: None,
                     latest_elo_date: None,
                 });
             player.games_played = player.games_played.checked_add(1).ok_or_else(|| {
@@ -364,6 +417,7 @@ impl PlayerSeasonsChunk {
             {
                 player.latest_elo = Some(elo);
                 player.latest_elo_date = Some(date);
+                player.latest_name_length = participant.name_length;
             }
             if keep_history {
                 season_history
@@ -376,6 +430,8 @@ impl PlayerSeasonsChunk {
                         elo: participant.elo,
                         won,
                         decided: has_winner,
+                        match_type,
+                        result_time_ms,
                     });
             }
         }
@@ -407,6 +463,7 @@ impl PlayerSeasonsChunk {
                 {
                     player.latest_elo = incoming.latest_elo;
                     player.latest_elo_date = Some(date);
+                    player.latest_name_length = incoming.latest_name_length;
                 }
             } else {
                 self.players.insert(key, incoming);
@@ -545,13 +602,18 @@ impl PlayerSeasons {
 
 impl SeasonHistory {
     /// Season start, season end, and length in seconds.
-    fn timeline(&self) -> Result<(i64, i64, f64), Box<dyn Error>> {
+    pub(crate) fn timeline(&self) -> Result<(i64, i64, f64), Box<dyn Error>> {
         let first_date = self.first_date.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "season history has no dates")
         })?;
         let last_date = self.last_date.unwrap_or(first_date);
         let duration = last_date.saturating_sub(first_date).max(1) as f64;
         Ok((first_date, last_date, duration))
+    }
+
+    /// One player's match events in dataset load order.
+    pub(crate) fn player_events(&self, uuid: &str) -> Option<&[TemporalEvent]> {
+        self.players.get(uuid).map(Vec::as_slice)
     }
 
     /// Cumulative win rate at every rated, decided match of the given players.

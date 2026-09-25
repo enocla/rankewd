@@ -15,7 +15,12 @@ use std::error::Error;
 use std::io;
 use std::path::Path;
 
-const DATE_SEASON_PROJECTION: &str = "message root { optional int64 date; optional int64 season; }";
+const DATE_SEASON_PROJECTION: &str = "message root { \
+    optional int64 date; \
+    optional int64 season; \
+    optional boolean decayed; \
+    optional boolean forfeited; \
+}";
 const DEFAULT_OUTPUT_FILE: &str = "output/games_per_week.png";
 const CHART_TITLE: &str = "Games Played per Week";
 const X_AXIS_TITLE: &str = "UTC week (ISO)";
@@ -77,6 +82,9 @@ fn collect_games_by_week(
                     .map_err(io::Error::other)?
                 {
                     let row = row.map_err(io::Error::other)?;
+                    if !dataset::passes_default_filters(&row)? {
+                        continue;
+                    }
                     let season = dataset::integer_field(&row, "season")?.ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "missing season")
                     })?;
