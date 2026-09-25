@@ -13,6 +13,7 @@ struct Options {
     dataset: PathBuf,
     seasons: Vec<u32>,
     analysis: String,
+    output: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -41,13 +42,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
         })?;
 
-    selected.run(&files)
+    selected.run(&files, options.output.as_deref())
 }
 
 fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, Box<dyn Error>> {
     let mut dataset = PathBuf::from("dataset/seasons_10_11.parquet");
     let mut seasons = DEFAULT_SEASONS.to_vec();
     let mut analysis = String::from("records");
+    let mut output = None;
     let mut args = args;
 
     while let Some(arg) = args.next() {
@@ -89,6 +91,13 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
                     .into_string()
                     .map_err(|_| invalid_arg("analysis name must be valid UTF-8"))?;
             }
+            Some("--output") => {
+                output = Some(
+                    args.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| invalid_arg("--output requires a file path"))?,
+                );
+            }
             _ => {
                 return Err(
                     invalid_arg(&format!("unknown argument: {}", arg.to_string_lossy())).into(),
@@ -101,6 +110,7 @@ fn parse_options(args: impl Iterator<Item = OsString>) -> Result<Option<Options>
         dataset,
         seasons,
         analysis,
+        output,
     }))
 }
 
@@ -194,8 +204,9 @@ fn invalid_arg(message: &str) -> io::Error {
 
 fn print_help() {
     println!(
-        "Usage: rankewd [--dataset FILE_OR_DIR] [--seasons N[,N...]] [--analysis NAME]\n\
+        "Usage: rankewd [--dataset FILE_OR_DIR] [--seasons N[,N...]] [--analysis NAME] [--output PNG]\n\
          Defaults: --dataset dataset/seasons_10_11.parquet --seasons 10,11 --analysis records\n\
+         games-per-week writes games_per_week.png unless --output is set\n\
          Available analyses: {}",
         analysis::available()
             .iter()
