@@ -27,6 +27,10 @@ selects which chart is drawn:
   games-per-week chart.
 - `games_per_player.rs` charts games played per player and reports the mean
   and median.
+- `games_per_hour.rs` charts matches by the UTC hour they started in, forfeits
+  included, and highlights the busiest hour.
+- `hour_entropy.rs` bins each player's hour-of-day entropy and charts the
+  distribution, forfeits included.
 - `rolling_win_duration.rs` charts each eligible player's ten-win rolling mean
   for type-2, non-decayed, non-forfeited wins over season progress.
 - `elo_versus_games.rs` charts latest Elo against games played.
@@ -43,7 +47,8 @@ selects which chart is drawn:
 
 There are no analysis-specific style, utility, or output submodules. Shared
 Parquet concerns, including the player-season and match-history aggregation the
-player analyses read, live in `src/dataset.rs`; shared chart typography, axis
+player analyses read and the per-UTC-hour match counts the two hour-of-day
+analyses share, live in `src/dataset.rs`; shared chart typography, axis
 padding, log key points, the Pearson correlation used by scatter plots, and
 legend components live in `src/plot.rs`.
 
@@ -57,6 +62,10 @@ without silently analyzing both seasons in the merged file.
 Curated Parquet files contain only `type = 2` rows. Independently of that data
 invariant, every analysis applies the default `decayed = false` and
 `forfeited = false` row filters before producing records, aggregates, or plots.
+The two hour-of-day analyses are the one exception: `games-per-hour` and
+`hour-entropy` describe when matches are played rather than how they ended, so
+they keep forfeited matches, drop only decayed rows, and say so in their
+reports.
 
 All generated artifacts default to `output/`. The directory is ignored, and
 `--output` relocates the generated charts rather than sending them back into
@@ -70,8 +79,9 @@ All generated artifacts default to `output/`. The directory is ignored, and
 3. `select_files` resolves a file or directory into `DatasetFile` values.
 4. `AnalysisInput` carries the files, optional row-level season filter, and
    output location.
-5. Analyses read through `dataset`, which applies the default match filters;
-   analyses return an `AnalysisReport` and do not print directly.
+5. Analyses read through `dataset`, which applies the default match filters
+   apart from the documented hour-of-day exception; analyses return an
+   `AnalysisReport` and do not print directly.
 6. The CLI prints the report.
 
 A season filter is applied to the `season` column even when a single merged

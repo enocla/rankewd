@@ -17,6 +17,9 @@ pub(crate) type ParquetFile = SerializedFileReader<File>;
 /// Lowest match count before a player's win rate is stable enough to chart.
 pub(crate) const MIN_GAMES_FOR_WINRATE_PLOTS: u64 = 100;
 
+/// Hours in one day, the resolution of the hour-of-day analyses.
+pub(crate) const HOURS_PER_DAY: usize = 24;
+
 /// Cumulative win-rate snapshots kept for every sampled player.
 pub(crate) const WINRATE_POINTS_PER_PLAYER: usize = 5;
 
@@ -66,6 +69,22 @@ const PLAYER_SUMMARY_PROJECTION: &str = "message root { \
         } \
     } \
 }";
+const HOUR_OF_DAY_PROJECTION: &str = "message root { \
+    optional int64 date; \
+    optional int64 season; \
+    optional boolean decayed; \
+    optional boolean forfeited; \
+    optional group players (LIST) { \
+        repeated group list { \
+            optional group element { \
+                optional binary uuid (STRING); \
+            } \
+        } \
+    } \
+}";
+
+const SECONDS_PER_HOUR: i64 = 3_600;
+const SECONDS_PER_DAY: i64 = 86_400;
 
 pub(crate) fn open(path: &Path) -> Result<ParquetFile, Box<dyn Error>> {
     Ok(SerializedFileReader::new(File::open(path)?)?)
@@ -814,4 +833,166 @@ pub(crate) fn elo_range(
         });
     }
     bounds.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no Elo values to plot").into())
+}
+
+/// One season's matches, split by the UTC hour their match started in.
+pub(crate) struct SeasonHours {
+    pub(crate) season: u32,
+    /// Non-decayed matches, forfeits included, per UTC hour of match start.
+    pub(crate) matches: [u64; HOURS_PER_DAY],
+    /// How many of those matches carry the source forfeit flag.
+    pub(crate) forfeited_matches: u64,
+    /// Every player's share of those matches, per UTC hour of match start.
+    pub(crate) players: HashMap<String, [u64; HOURS_PER_DAY]>,
+}
+
+impl SeasonHours {
+    /// Every non-decayed match in the season, forfeits included.
+    pub(crate) fn match_count(&self) -> u64 {
+        self.matches.iter().sum()
+    }
+}
+
+#[derive(Default)]
+struct SeasonHourTotals {
+    matches: [u64; HOURS_PER_DAY],
+    forfeited_matches: u64,
+    players: HashMap<String, [u64; HOURS_PER_DAY]>,
+}
+
+#[derive(Default)]
+struct SeasonHoursChunk {
+    by_season: BTreeMap<u32, SeasonHourTotals>,
+}
+
+/// The UTC hour of day, 0 through 23, holding a Unix-seconds timestamp.
+fn utc_hour_of_day(timestamp: i64) -> usize {
+    let seconds_into_day = timestamp.rem_euclid(SECONDS_PER_DAY);
+    usize::try_from(seconds_into_day / SECONDS_PER_HOUR).expect("a day holds 24 UTC hours")
+}
+
+/// Reads the selected files into per-UTC-hour match counts, by season.
+///
+/// These counts describe when matches are played rather than how they ended, so
+/// forfeited matches are kept and only decayed rows are dropped. That deviates
+/// from [`passes_default_filters`], so the analyses that read these counts have
+/// to report how many forfeited matches they counted.
+pub(crate) fn load_season_hours<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    seasons: Option<&[u32]>,
+) -> Result<Vec<SeasonHours>, Box<dyn Error>> {
+    let mut combined = SeasonHoursChunk::default();
+    let projection = parse_message_type(HOUR_OF_DAY_PROJECTION)?;
+
+    for path in paths {
+        let reader = open(path)?;
+        let chunks: Result<Vec<_>, io::Error> = (0..reader.num_row_groups())
+            .into_par_iter()
+            .filter(|&index| row_group_matches(&reader, index, seasons))
+            .map(|index| {
+                let worker_reader =
+                    open(path).map_err(|error| io::Error::other(error.to_string()))?;
+                let row_group = worker_reader
+                    .get_row_group(index)
+                    .map_err(io::Error::other)?;
+                let mut chunk = SeasonHoursChunk::default();
+                for row in row_group
+                    .get_row_iter(Some(projection.clone()))
+                    .map_err(io::Error::other)?
+                {
+                    chunk.add_row(&row.map_err(io::Error::other)?, seasons)?;
+                }
+                Ok(chunk)
+            })
+            .collect();
+        for chunk in chunks? {
+            combined.merge(chunk);
+        }
+    }
+
+    if combined.by_season.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no non-decayed matches found in selected files",
+        )
+        .into());
+    }
+
+    Ok(combined
+        .by_season
+        .into_iter()
+        .map(|(season, totals)| SeasonHours {
+            season,
+            matches: totals.matches,
+            forfeited_matches: totals.forfeited_matches,
+            players: totals.players,
+        })
+        .collect())
+}
+
+impl SeasonHoursChunk {
+    /// Adds one match to the hour it started in, for its season and for every
+    /// player it contains. A repeated UUID in one match counts as one
+    /// appearance.
+    fn add_row(&mut self, row: &Row, seasons: Option<&[u32]>) -> io::Result<()> {
+        if boolean_field(row, "decayed")? != Some(false) {
+            return Ok(());
+        }
+
+        let season = integer_field(row, "season")?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing season"))?;
+        let season = u32::try_from(season).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "season is outside u32 range")
+        })?;
+        if seasons.is_some_and(|requested| !requested.contains(&season)) {
+            return Ok(());
+        }
+
+        let timestamp = integer_field(row, "date")?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing match date"))?;
+        let hour = utc_hour_of_day(timestamp);
+        let totals = self.by_season.entry(season).or_default();
+        totals.matches[hour] = totals.matches[hour].saturating_add(1);
+        if boolean_field(row, "forfeited")? == Some(true) {
+            totals.forfeited_matches = totals.forfeited_matches.saturating_add(1);
+        }
+
+        let Some(participants) = list_field(row, "players")? else {
+            return Ok(());
+        };
+        let mut uuids: Vec<&str> = Vec::new();
+        for participant in participants.elements() {
+            let Field::Group(participant) = participant else {
+                return Err(invalid_field("player entry", participant));
+            };
+            if let Some(uuid) = string_field(participant, "uuid")?
+                && !uuids.contains(&uuid)
+            {
+                uuids.push(uuid);
+            }
+        }
+        for uuid in uuids {
+            let hours = totals.players.entry(uuid.to_owned()).or_default();
+            hours[hour] = hours[hour].saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, chunk: Self) {
+        for (season, incoming) in chunk.by_season {
+            let merged = self.by_season.entry(season).or_default();
+            for (hour, matches) in incoming.matches.into_iter().enumerate() {
+                merged.matches[hour] = merged.matches[hour].saturating_add(matches);
+            }
+            merged.forfeited_matches = merged
+                .forfeited_matches
+                .saturating_add(incoming.forfeited_matches);
+            for (uuid, hours) in incoming.players {
+                let merged_hours = merged.players.entry(uuid).or_default();
+                for (hour, matches) in hours.into_iter().enumerate() {
+                    merged_hours[hour] = merged_hours[hour].saturating_add(matches);
+                }
+            }
+        }
+    }
 }

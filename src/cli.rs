@@ -9,9 +9,10 @@ use std::path::PathBuf;
     name = "rankewd",
     version,
     about = "Analyze Rankewd Parquet datasets",
-    after_help = "Available analyses: records, games-per-week, games-per-player, rolling-win-duration, \
+    after_help = "Available analyses: records, games-per-week, games-per-player, games-per-hour, hour-entropy, rolling-win-duration, \
 elo-versus-games, elo-versus-win-duration, name-underscores-versus-elo, elo-distribution, winrate-versus-elo, winrate-over-time, \
-sampled-winrate-over-time\n\nEach analysis runs on its own; the plot analyses write one PNG per season. All analyses exclude decayed and forfeited matches by default.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
+sampled-winrate-over-time\n\nEach analysis runs on its own; the plot analyses write one PNG per season. All analyses exclude decayed and forfeited matches by default, except \
+games-per-hour and hour-entropy, which describe when matches are played rather than how they ended and so keep forfeited matches.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
 )]
 struct Cli {
     /// Parquet file or directory to analyze.

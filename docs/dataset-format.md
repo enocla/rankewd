@@ -8,7 +8,11 @@ because they do not need every field in the full source record.
 
 Curated Parquet files contain only rows whose `type` field is `2`. Every
 analysis also requires `decayed` and `forfeited` to be `false`; rows with either
-value true, or with either value missing, are excluded from all results.
+value true, or with either value missing, are excluded from all results. The
+`games-per-hour` and `hour-entropy` analyses are the exception: they describe
+when matches are played rather than how they ended, so they require
+`decayed = false` only, keep forfeited matches, and read a missing `forfeited`
+value as not forfeited.
 
 ## Reading a source record
 
@@ -74,6 +78,31 @@ equal-weight mean player duration in fixed season-progress bins: the mean of eac
 player's durations in a bin, averaged over the players that reach that bin. The
 reported improvement compares the mean of the first ten retained bins with the
 mean of the last ten, after dropping every bin below 10% season progress.
+
+## Hour-of-day distribution
+
+Run `rankewd --analysis games-per-hour` to count matches by the UTC hour their
+`date` falls in, one bin per hour from `00:00` to `23:00` UTC, and
+`rankewd --analysis hour-entropy` to bin the same counts per player. Both keep
+forfeited matches and drop only decayed rows, because a forfeit still happened
+at a particular hour, and each per-season player is credited with one match in
+an hour per match they appear in.
+
+`games_per_hour_season_N.png` draws one bar per UTC hour and highlights the
+busiest hour in yellow, with that hour also named in the chart title. The
+report repeats the busiest and quietest hours with their match counts and
+shares, and the share of matches that were forfeited.
+
+`hour_entropy_season_N.png` draws one bar per 0.25-bit entropy bin and marks the
+median with a dashed line. A player's entropy is the Shannon entropy, in bits,
+of their own 24-hour distribution: 0 bits means every one of their matches fell
+in a single UTC hour, and `log2(24) = 4.58` bits means an even spread across the
+whole day. A bin value therefore also reads as `2^bits`, the number of hours a
+player would have to use equally to reach the same spread. Players with fewer
+than 100 matches are skipped and counted in the report, because a plug-in
+entropy over a handful of games mostly measures how few games there were. Both
+analyses group the counts by the `season` column, so `--seasons all` writes one
+chart per season.
 
 ## Player-season summary data
 
