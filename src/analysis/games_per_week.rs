@@ -7,7 +7,6 @@ use crate::plot::{
 };
 use chrono::{DateTime, Datelike, Duration, Utc};
 use parquet::file::reader::FileReader;
-use parquet::schema::parser::parse_message_type;
 use plotters::prelude::*;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -63,10 +62,10 @@ fn collect_games_by_week(
     input: &AnalysisInput<'_>,
 ) -> Result<BTreeMap<(i32, u32), u64>, Box<dyn Error>> {
     let mut games_by_week = BTreeMap::new();
-    let projection = parse_message_type(DATE_SEASON_PROJECTION)?;
 
     for file in input.files() {
         let reader = dataset::open(&file.path)?;
+        let projection = dataset::compatible_projection(&reader, DATE_SEASON_PROJECTION)?;
         let chunks: Result<Vec<WeekCounts>, io::Error> = (0..reader.num_row_groups())
             .into_par_iter()
             .filter(|&index| dataset::row_group_matches(&reader, index, input.seasons()))
@@ -218,6 +217,8 @@ fn draw_chart(path: &Path, data: &[WeeklyCount]) -> Result<(), Box<dyn Error>> {
     }))?;
     chart
         .configure_series_labels()
+        .legend_area_size(60)
+        .margin(20)
         .position(SeriesLabelPosition::UpperRight)
         .label_font((FONT_FAMILY, LEGEND_FONT_SIZE, &BASE_800))
         .background_style(PAPER)

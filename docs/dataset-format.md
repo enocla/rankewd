@@ -149,3 +149,148 @@ projection of each match. Only rows with `decayed = false` and
   `veteran-edge` and `season-retention` need several seasons selected.
 - **Countries** use the last country code a player-season lists; player-seasons
   without one are counted in the report and skipped.
+
+
+## Converting source JSONL exports
+
+The reusable importer is [`scripts/jsonl_to_parquet.py`](../scripts/jsonl_to_parquet.py).
+It infers the schema from the complete export, writes Zstandard-compressed
+Parquet, and keeps only `type = 2`. It preserves real forfeits and synthetic
+decay records; each analysis applies its own documented filter. Historical
+fractional `changes[].eloRate` values remain doubles. Rating changes are stored
+as signed 64-bit integers.
+
+Run from the repository root through the Nix shell. `uv` supplies DuckDB for the
+import session; no Python runtime dependency is added to the Rust application:
+
+```sh
+direnv exec . uv run --with duckdb==1.5.6 python - <<'PY'
+from pathlib import Path
+from scripts.jsonl_to_parquet import convert
+for source in sorted(Path('.').glob('season_[34]_*.jsonl')):
+    convert(source, Path('dataset') / source.with_suffix('.parquet').name)
+PY
+```
+
+An explicit destination places curated input in `dataset/`. Calling
+`convert(source)` without one writes to `output/curated/`. Existing files are
+never overwritten. Each import verifies the row count, unique match-ID count,
+season labels, absence of other match types, and a checksum across research
+fields before publishing the file. Raw JSONL files remain unchanged.
+
+## Forfeit and recovery research
+
+The `opponent-after-death`, `opponent-after-death-winrate`, `opponent-death-timing`, `recovery-*`, `death-reset-exclusions`, `death-rank-deficit`, and `forfeit-*`
+analyses are an explicit exception requested for this study: they keep real
+forfeited matches while excluding decay. Other analyses retain their existing
+filters. Match-level `forfeited` means no completions; individual quit exposure
+comes from `projectelo.timeline.forfeit`. Unknown quit outcomes are not silently
+assigned to a player.
+
+The shared loader uses the first ordinary death as the sole recovery exposure.
+World-reset events are ignored completely: they do not trigger exposures, affect
+continuation status, contribute to opponent adversity, restart the recorded split
+history, or set the fallback event bound for missing clocks. Intentional
+spawnpoint deaths (`projectelo.timeline.death_spawnpoint`) remain excluded from
+all research exposures and retained only as coverage-audit counts.
+
+Every recovery and opponent-outcome plot uses deaths with **no recorded own
+forfeit in that match**, without requiring another split. This retains players
+who lose before another split. Absence of an explicit forfeit is an observable
+proxy, not proof of active play; unclassified exits remain eligible. Observation
+stops at the earliest completion, either player's first forfeit, or match-end
+bound. Events after that cutoff cannot contribute. The ordinary-death count
+after a recorded forfeit is audited. The win-rate CSV retains all-first-death
+outcomes as a separate descriptive reference (behavior 0); behavior 1 is the
+no-own-forfeit cohort plotted. Recovery confidence intervals conservatively
+cluster both players and matches.
+
+Split context is cumulative recorded progress before the death, because world
+reset events are ignored; it is not necessarily position in the current attempt.
+The Elo-efficiency analyses start at first ordinary death and retain forfeiting
+as the comparison action. Habit profiles retain all rated matches to measure
+forfeit rates. Neither analysis uses reset events. Longitudinal continuation
+exposure is the fraction of ordinary-death matches with no own forfeit, without
+requiring a later split; at least ten prior death matches are required.
+Habit and improvement intervals cluster repeated UUIDs. These comparisons
+are observational rather than randomized continuation policies.
+
+Each research plot writes a PNG and matching CSV. A source-fingerprinted Zstandard-compressed JSON
+cache avoids rescanning all match timelines for every plot; it includes source
+paths, sizes, modification times, requested seasons and measurement version.
+`--output` relocates the chart, CSV and shared cache to the selected family.
+Neither the merged season 10–11 copy nor duplicate match IDs are double-counted.
+
+Performance profiles require 100 rated games. Learning cohorts qualify from
+50 previous rated games at season days 30, 60 and 90, are active within the
+previous 14 days, and have a complete next-30-day export window. Outcome
+estimates require at least 10 later rated games; zero-follow-up cohorts are
+reported. Completion-pace comparisons also require at least 10 completions
+in each block and shared seed/bastion cells with two completions per block.
+Only cells sharing at least 10 weighted completions are compared.
+
+Longitudinal outcomes are centered within season, landmark, baseline rank,
+200-Elo band, five-minute completion-pace band, and 200-Elo prior-gain band.
+The continuous exposure slope demeans both exposure and outcome in those
+strata. Returning-player comparisons use adjacent seasons and previous last
+50 / subsequent first 50 rated games. Rating position compares percentiles
+within those corresponding windows, not raw Elo across resets. These controls
+reduce measured confounding but do not identify causal effects.
+
+Efficiency compares explicit quit outcomes after death with no-own-forfeit outcomes, within
+season/100-Elo band/opponent-gap/split/deficit cells represented by at least
+20 observations in each action group. Both groups use identical cell weights.
+Ten-game horizons include the current outcome and nine subsequent rated games;
+time is the current remaining match clock plus subsequent match durations.
+The session sensitivity additionally requires gaps no longer than 30 minutes.
+Queue time, penalties, unobserved practice and horizon-selection bias remain
+outside the estimate. Ratios use aggregate Elo divided by aggregate time.
+
+
+Short cross-season completion blocks additionally use a broader seed-type
+matching estimate: combine bastion layouts within each overworld seed type,
+require two completions in a shared type and ten weighted common completions.
+The within-season and recovery-pace plots retain the stricter seed-and-layout
+matching. This difference is explicit because exact layout matching leaves too
+few cross-season pairs for reliable rank-level curves.
+
+Season 1 contains no ordinary-death events; its
+normal-death probability is unavailable, not zero. Early-season Elo bands use
+the same numerical thresholds for comparison and need not represent historical
+rank names (season 1 had a different rank system).
+
+The baseline-stratum plots and slopes exclude strata with no exposure variation
+(including singletons). Their CLI reports distinguish initial measurable cohorts
+from observations with comparable peers. Completion-pace evidence remains
+conditional on enough observed completions; it cannot rule out learning on
+uncompleted attempts. Cache publication is atomic and compressed.
+
+Older draws sometimes have `result.time = 0`. They remain in outcome and
+habit denominators. A last-event bound validates their recorded event ordering
+but is never counted as observed playing time. Elo/hour uses only outcomes
+with measured durations, and ten-game efficiency requires measured clocks for
+every game in the horizon. The audit reports missing-duration counts.
+
+`bash scripts/run-forfeit-research.sh` reproduces 30 main plots restricted to
+seasons 10 and 11, a separate all-season recovery comparison, and the
+Markdown/HTML illustrated report. The report
+builder uses pinned Python formatting dependencies through `uv` and embeds a
+local copy of SF Pro Text. The main report checks that its measurement cache
+contains only seasons 10 and 11. Cross-season main analyses therefore cover
+only the 10-to-11 transition. The earlier complete all-season report is
+preserved separately in `output/research/all_seasons/`. It formats Rust
+estimates; statistical estimation remains in the registered Rust analyses.
+
+
+Opponent-after-death comparisons count each player-match at the first ordinary
+player death. Intentional spawnpoint deaths are excluded. An opponent event
+must occur strictly later and no later than the match end; ties are not later.
+The last ordinary opponent death detects repeat deaths even if the opponent had
+already died before the player. Explicit opponent forfeits are distinct from
+unclassified exits. Death and forfeit frequencies overlap; the win-rate plot
+uses mutually exclusive neither/death-only/forfeit-only/both groups. A second
+plot separates earlier and later ordinary opponent deaths. All first deaths and
+the selected continuation subset are reported separately. Own forfeits can end
+observation before an opponent event occurs. The comparisons describe observed
+future events, not a probability forecast available at the death, a fixed-time
+hazard or a causal effect. Intervals use conservative player/match clustering.

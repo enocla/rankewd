@@ -41,6 +41,37 @@ mod veteran_edge;
 mod weekday_hour_heatmap;
 mod win_time_distribution;
 
+mod death_rank_deficit;
+mod death_reset_exclusions;
+mod forfeit_calibration;
+mod forfeit_completion;
+mod forfeit_coverage;
+mod forfeit_cross_season_pace;
+mod forfeit_cross_season_rating;
+mod forfeit_death_improvement;
+mod forfeit_hour_improvement;
+mod forfeit_improvement;
+mod forfeit_pace;
+mod forfeit_pace_improvement;
+mod forfeit_rating;
+mod forfeit_residual;
+mod forfeit_retention;
+mod forfeit_winrate;
+mod opponent_after_death;
+mod opponent_after_death_winrate;
+mod opponent_death_timing;
+mod recovery_deficit;
+mod recovery_efficiency;
+mod recovery_elo;
+mod recovery_improvement;
+mod recovery_opponent;
+mod recovery_outcomes;
+mod recovery_pace_improvement;
+mod recovery_seasons;
+mod recovery_stage;
+mod recovery_time;
+mod recovery_winrate;
+
 /// Directory used for generated artifacts when `--output` is omitted.
 pub const DEFAULT_OUTPUT_DIRECTORY: &str = "output";
 
@@ -142,6 +173,36 @@ pub trait Analysis {
 /// Available analyses. Add new implementations here to expose them to the CLI.
 pub fn available() -> Vec<Box<dyn Analysis>> {
     vec![
+        Box::new(recovery_winrate::RecoveryWinrate),
+        Box::new(recovery_seasons::RecoverySeasons),
+        Box::new(recovery_stage::RecoveryStage),
+        Box::new(recovery_deficit::RecoveryDeficit),
+        Box::new(recovery_opponent::RecoveryOpponent),
+        Box::new(opponent_after_death::OpponentAfterDeath),
+        Box::new(opponent_after_death_winrate::OpponentAfterDeathWinrate),
+        Box::new(opponent_death_timing::OpponentDeathTiming),
+        Box::new(death_rank_deficit::DeathRankDeficit),
+        Box::new(recovery_time::RecoveryTime),
+        Box::new(death_reset_exclusions::DeathResetExclusions),
+        Box::new(recovery_outcomes::RecoveryOutcomes),
+        Box::new(forfeit_coverage::ForfeitCoverage),
+        Box::new(forfeit_calibration::ForfeitCalibration),
+        Box::new(forfeit_rating::ForfeitRating),
+        Box::new(forfeit_winrate::ForfeitWinrate),
+        Box::new(forfeit_residual::ForfeitResidual),
+        Box::new(forfeit_pace::ForfeitPace),
+        Box::new(forfeit_completion::ForfeitCompletion),
+        Box::new(forfeit_improvement::ForfeitImprovement),
+        Box::new(forfeit_hour_improvement::ForfeitHourImprovement),
+        Box::new(forfeit_pace_improvement::ForfeitPaceImprovement),
+        Box::new(recovery_improvement::RecoveryImprovement),
+        Box::new(forfeit_death_improvement::ForfeitDeathImprovement),
+        Box::new(recovery_pace_improvement::RecoveryPaceImprovement),
+        Box::new(forfeit_retention::ForfeitRetention),
+        Box::new(forfeit_cross_season_pace::ForfeitCrossSeasonPace),
+        Box::new(forfeit_cross_season_rating::ForfeitCrossSeasonRating),
+        Box::new(recovery_elo::RecoveryElo),
+        Box::new(recovery_efficiency::RecoveryEfficiency),
         Box::new(records::RecordCount),
         Box::new(games_per_week::GamesPerWeek),
         Box::new(games_per_player::GamesPerPlayer),

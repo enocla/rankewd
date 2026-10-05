@@ -12,7 +12,6 @@
         let
           pkgs = import nixpkgs { inherit system; };
           fontconfig = pkgs.fontconfig;
-          lilexFont = pkgs.nerd-fonts.lilex;
         in {
           default = pkgs.mkShell {
             packages = with pkgs; [
@@ -20,14 +19,14 @@
               rustc
               rustfmt
               clippy
+              python3
+              uv
               pkg-config
               fontconfig
               fontconfig.dev
-              lilexFont
             ];
 
             PKG_CONFIG_PATH = "${fontconfig.dev}/lib/pkgconfig";
-            FONTCONFIG_FILE = "${pkgs.makeFontsConf { fontDirectories = [ lilexFont ]; }}";
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ fontconfig pkgs.freetype ];
           };
         });

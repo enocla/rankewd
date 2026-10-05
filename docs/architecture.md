@@ -122,7 +122,7 @@ the public compatibility model for the original JSON Lines export; they are not
 loaded for every analysis because most analyses only need a small projection.
 
 Chart typography and colors are centralized in `src/plot.rs`. Renderers use
-Lilex Nerd Font, the Flexoki palette, 1400×800 canvases, large axis/tick text,
+SF Pro Text, the Flexoki palette, 2800×1600 canvases, large axis/tick text,
 upper-right legends, and the required label areas.
 
 Automated tests are intentionally not part of this project. Changes are

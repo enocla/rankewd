@@ -8,19 +8,19 @@ use std::io;
 use std::path::Path;
 
 // Shared chart typography and layout requirements. All user-facing chart text
-// uses Lilex Nerd Font; all colors come from the Flexoki palette.
-pub(crate) const FONT_FAMILY: &str = "Lilex Nerd Font";
-pub(crate) const CHART_WIDTH: u32 = 1400;
-pub(crate) const CHART_HEIGHT: u32 = 800;
-pub(crate) const CHART_TITLE_SIZE: u32 = 48;
-pub(crate) const CHART_MARGIN: u32 = 36;
-pub(crate) const LABEL_AREA_SIZE: u32 = 112;
-pub(crate) const Y_LABEL_AREA_SIZE: u32 = 176;
-pub(crate) const AXIS_DESC_FONT_SIZE: u32 = 40;
-pub(crate) const TICK_LABEL_FONT_SIZE: u32 = 32;
-pub(crate) const LEGEND_WIDTH: i32 = 20;
-pub(crate) const LEGEND_FONT_SIZE: u32 = 18;
-pub(crate) const POINT_RADIUS: i32 = 2;
+// uses SF Pro Text; all colors come from the Flexoki palette.
+pub(crate) const FONT_FAMILY: &str = "SF Pro Text";
+pub(crate) const CHART_WIDTH: u32 = 2800;
+pub(crate) const CHART_HEIGHT: u32 = 1600;
+pub(crate) const CHART_TITLE_SIZE: u32 = 96;
+pub(crate) const CHART_MARGIN: u32 = 72;
+pub(crate) const LABEL_AREA_SIZE: u32 = 224;
+pub(crate) const Y_LABEL_AREA_SIZE: u32 = 352;
+pub(crate) const AXIS_DESC_FONT_SIZE: u32 = 80;
+pub(crate) const TICK_LABEL_FONT_SIZE: u32 = 64;
+pub(crate) const LEGEND_WIDTH: i32 = 40;
+pub(crate) const LEGEND_FONT_SIZE: u32 = 36;
+pub(crate) const POINT_RADIUS: i32 = 4;
 
 pub(crate) const PAPER: RGBColor = RGBColor(255, 252, 240);
 pub(crate) const BASE_150: RGBColor = RGBColor(218, 216, 206);
@@ -49,9 +49,9 @@ pub(crate) const SERIES_COLORS: [RGBColor; 8] = [
 ];
 
 /// Line width of the data series in the added line charts.
-pub(crate) const SERIES_STROKE: u32 = 3;
+pub(crate) const SERIES_STROKE: u32 = 6;
 /// Font size of the values printed inside heatmap cells.
-pub(crate) const CELL_FONT_SIZE: u32 = 20;
+pub(crate) const CELL_FONT_SIZE: u32 = 40;
 
 pub(crate) fn create_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent()
@@ -135,6 +135,8 @@ where
     chart
         .configure_series_labels()
         .position(SeriesLabelPosition::UpperRight)
+        .legend_area_size(60)
+        .margin(20)
         .label_font((FONT_FAMILY, LEGEND_FONT_SIZE, &BASE_800))
         .background_style(PAPER)
         .border_style(BASE_300)
@@ -205,17 +207,17 @@ where
     area.draw(&Text::new(
         "Start",
         (left + margin, 0.91),
-        (FONT_FAMILY, 16).into_font().color(&BASE_800),
+        (FONT_FAMILY, 32).into_font().color(&BASE_800),
     ))?;
     area.draw(&Text::new(
         "End",
         (right.saturating_sub(margin * 5), 0.91),
-        (FONT_FAMILY, 16).into_font().color(&BASE_800),
+        (FONT_FAMILY, 32).into_font().color(&BASE_800),
     ))?;
     Ok(())
 }
 
-/// Creates the parent directory, then a paper-filled 1400×800 canvas at `path`.
+/// Creates the parent directory, then a paper-filled 2800×1600 canvas at `path`.
 pub(crate) fn canvas(path: &Path) -> Result<DrawingArea<BitMapBackend<'_>, Shift>, Box<dyn Error>> {
     create_parent(path)?;
     let root = BitMapBackend::new(path, (CHART_WIDTH, CHART_HEIGHT)).into_drawing_area();
@@ -270,7 +272,7 @@ pub(crate) fn legend_line(color: RGBColor) -> impl Fn((i32, i32)) -> PathElement
 
 /// Legend glyph for a filled bar or area.
 pub(crate) fn legend_box(color: RGBColor) -> impl Fn((i32, i32)) -> Rectangle<(i32, i32)> {
-    move |(x, y)| Rectangle::new([(x, y - 6), (x + LEGEND_WIDTH, y + 6)], color.filled())
+    move |(x, y)| Rectangle::new([(x, y - 12), (x + LEGEND_WIDTH, y + 12)], color.filled())
 }
 
 /// Blends two colors; `fraction = 0` gives `from`, `1` gives `to`.
@@ -393,9 +395,9 @@ pub(crate) fn draw_line_chart(path: &Path, spec: &LineChart<'_>) -> Result<(), B
         chart
             .draw_series(DashedLineSeries::new(
                 [(spec.x_range.start, value), (spec.x_range.end, value)],
-                12,
-                8,
-                BASE_500.stroke_width(2),
+                24,
+                16,
+                BASE_500.stroke_width(4),
             ))?
             .label(label)
             .legend(legend_line(BASE_500));
@@ -450,4 +452,91 @@ pub(crate) fn percent_tick(value: &f64) -> String {
 /// Tick label for a whole number.
 pub(crate) fn integer_tick(value: &f64) -> String {
     format!("{value:.0}")
+}
+
+/// A reusable chart component for uncertainty-bearing research series.
+pub(crate) struct ResearchCurve {
+    pub(crate) label: String,
+    pub(crate) color: RGBColor,
+    pub(crate) points: Vec<crate::dataset::ResearchEstimate>,
+}
+pub(crate) struct ResearchChart<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) x_desc: &'a str,
+    pub(crate) y_desc: &'a str,
+    pub(crate) x_range: std::ops::Range<f64>,
+    pub(crate) y_range: std::ops::Range<f64>,
+    pub(crate) x_format: &'a dyn Fn(&f64) -> String,
+    pub(crate) y_format: &'a dyn Fn(&f64) -> String,
+    pub(crate) x_labels: usize,
+    pub(crate) curves: Vec<ResearchCurve>,
+    pub(crate) reference: Option<(f64, &'a str)>,
+}
+pub(crate) fn draw_research_chart(
+    path: &Path,
+    spec: &ResearchChart<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let root = canvas(path)?;
+    if spec.curves.iter().all(|c| c.points.is_empty()) {
+        root.draw(&Text::new(
+            spec.title,
+            (140, 160),
+            (FONT_FAMILY, CHART_TITLE_SIZE).into_font().color(&BASE_800),
+        ))?;
+        root.draw(&Text::new(
+            "Insufficient data for the plotted estimates",
+            (400, 800),
+            (FONT_FAMILY, TICK_LABEL_FONT_SIZE)
+                .into_font()
+                .color(&BASE_800),
+        ))?;
+        root.present()?;
+        return Ok(());
+    }
+    let mut chart = chart_builder(&root, spec.title)
+        .build_cartesian_2d(spec.x_range.clone(), spec.y_range.clone())?;
+    style_mesh(&mut chart.configure_mesh(), spec.x_desc, spec.y_desc)
+        .x_labels(spec.x_labels)
+        .y_labels(7)
+        .x_label_formatter(spec.x_format)
+        .y_label_formatter(spec.y_format)
+        .draw()?;
+    if let Some((y, label)) = spec.reference {
+        chart
+            .draw_series(DashedLineSeries::new(
+                [(spec.x_range.start, y), (spec.x_range.end, y)],
+                24,
+                16,
+                BASE_500.stroke_width(4),
+            ))?
+            .label(label)
+            .legend(legend_line(BASE_500));
+    }
+    for curve in &spec.curves {
+        if curve.points.is_empty() {
+            continue;
+        }
+        chart
+            .draw_series(LineSeries::new(
+                curve.points.iter().map(|p| (p.x, p.mean)),
+                curve.color.stroke_width(SERIES_STROKE),
+            ))?
+            .label(&curve.label)
+            .legend(legend_line(curve.color));
+        chart.draw_series(curve.points.iter().map(|p| {
+            PathElement::new(
+                vec![(p.x, p.low), (p.x, p.high)],
+                curve.color.stroke_width(4),
+            )
+        }))?;
+        chart.draw_series(
+            curve
+                .points
+                .iter()
+                .map(|p| Circle::new((p.x, p.mean), 8, curve.color.filled())),
+        )?;
+    }
+    draw_series_legend(&mut chart)?;
+    root.present()?;
+    Ok(())
 }

@@ -3,3 +3,6 @@
 /output
 
 dataset
+
+/season_*.jsonl
+/scripts/__pycache__/

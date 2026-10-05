@@ -100,7 +100,7 @@ pub(crate) fn record_count(path: &Path, seasons: Option<&[u32]>) -> Result<i64, 
     }
 
     let reader = open(path)?;
-    let projection = parse_message_type(RECORD_FILTER_PROJECTION)?;
+    let projection = compatible_projection(&reader, RECORD_FILTER_PROJECTION)?;
     let mut count = 0i64;
     for row in reader.get_row_iter(Some(projection))? {
         let row = row?;
@@ -530,14 +530,16 @@ impl PlayerSeasons {
         keep_history: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut combined = PlayerSeasonsChunk::default();
-        let projection = parse_message_type(if keep_history {
-            PLAYER_PROJECTION
-        } else {
-            PLAYER_SUMMARY_PROJECTION
-        })?;
-
         for path in paths {
             let reader = open(path)?;
+            let projection = compatible_projection(
+                &reader,
+                if keep_history {
+                    PLAYER_PROJECTION
+                } else {
+                    PLAYER_SUMMARY_PROJECTION
+                },
+            )?;
             let chunks: Result<Vec<_>, io::Error> = (0..reader.num_row_groups())
                 .into_par_iter()
                 .filter(|&index| row_group_matches(&reader, index, seasons))
@@ -885,10 +887,9 @@ pub(crate) fn load_season_hours<'a>(
     seasons: Option<&[u32]>,
 ) -> Result<Vec<SeasonHours>, Box<dyn Error>> {
     let mut combined = SeasonHoursChunk::default();
-    let projection = parse_message_type(HOUR_OF_DAY_PROJECTION)?;
-
     for path in paths {
         let reader = open(path)?;
+        let projection = compatible_projection(&reader, HOUR_OF_DAY_PROJECTION)?;
         let chunks: Result<Vec<_>, io::Error> = (0..reader.num_row_groups())
             .into_par_iter()
             .filter(|&index| row_group_matches(&reader, index, seasons))
@@ -1279,6 +1280,31 @@ fn project_schema(schema: &Type, paths: &[Vec<&str>], depth: usize) -> Option<Ty
     builder.build().ok()
 }
 
+/// Select requested column paths while retaining this file's root name,
+/// integer annotations and historical numeric types. DuckDB and the older
+/// exporter use different but equivalent Parquet schema annotations.
+pub(crate) fn compatible_projection(
+    reader: &ParquetFile,
+    specification: &str,
+) -> Result<Type, Box<dyn Error>> {
+    fn leaves<'a>(node: &'a Type, prefix: &mut Vec<&'a str>, paths: &mut Vec<Vec<&'a str>>) {
+        for field in node.get_fields() {
+            prefix.push(field.name());
+            if field.is_primitive() {
+                paths.push(prefix.clone());
+            } else {
+                leaves(field, prefix, paths);
+            }
+            prefix.pop();
+        }
+    }
+    let requested = parse_message_type(specification)?;
+    let mut paths = Vec::new();
+    leaves(&requested, &mut Vec::new(), &mut paths);
+    project_schema(reader.metadata().file_metadata().schema(), &paths, 0)
+        .ok_or_else(|| io::Error::other("none of the requested columns exist").into())
+}
+
 fn duel_projection(schema: &Type, columns: DuelColumns) -> Result<Type, Box<dyn Error>> {
     let paths: Vec<Vec<&str>> = DUEL_COLUMNS
         .iter()
@@ -1648,4 +1674,1252 @@ pub(crate) fn session_slots(duels: &[Duel], appearances: &[Appearance]) -> Vec<S
         position = if last { 0 } else { position + 1 };
     }
     slots
+}
+
+// Forfeit research is an explicitly requested exception to the default filters.
+// Shared event measurements, cohorts and sufficient statistics live here so
+// each registered plot can remain self-contained in its own analysis file.
+use crate::analysis::AnalysisInput;
+use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, BufWriter, Write};
+
+pub(crate) const RESEARCH_RANKS: [&str; 7] = [
+    "Coal",
+    "Iron",
+    "Gold",
+    "Emerald",
+    "Diamond",
+    "Netherite",
+    "Unrated",
+];
+pub(crate) fn research_rank(elo: Option<i32>) -> u8 {
+    match elo {
+        None => 6,
+        Some(x) if x < 600 => 0,
+        Some(x) if x < 900 => 1,
+        Some(x) if x < 1200 => 2,
+        Some(x) if x < 1500 => 3,
+        Some(x) if x < 2000 => 4,
+        Some(_) => 5,
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub(crate) struct ResearchMoment {
+    pub(crate) n: u64,
+    pub(crate) sum: f64,
+    pub(crate) sum_sq: f64,
+}
+impl ResearchMoment {
+    pub(crate) fn add(&mut self, x: f64) {
+        if x.is_finite() {
+            self.n += 1;
+            self.sum += x;
+            self.sum_sq += x * x;
+        }
+    }
+    pub(crate) fn mean(&self) -> Option<f64> {
+        (self.n > 0).then(|| self.sum / self.n as f64)
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ResearchBlock {
+    pub(crate) games: u64,
+    pub(crate) quits: u64,
+    pub(crate) wins: u64,
+    pub(crate) deaths: u64,
+    pub(crate) death_matches: u64,
+    pub(crate) continued_after_death: u64,
+    pub(crate) elo: ResearchMoment,
+    pub(crate) delta: ResearchMoment,
+    pub(crate) timed_delta: ResearchMoment,
+    pub(crate) residual: ResearchMoment,
+    pub(crate) minutes: f64,
+    pub(crate) pace: ResearchMoment,
+    pub(crate) nether: ResearchMoment,
+    pub(crate) seed_pace: [ResearchMoment; 20],
+}
+impl ResearchBlock {
+    pub(crate) fn quit_rate(&self) -> f64 {
+        self.quits as f64 / self.games.max(1) as f64
+    }
+    pub(crate) fn elo_per_100(&self) -> Option<f64> {
+        self.delta.mean().map(|x| x * 100.0)
+    }
+    pub(crate) fn elo_per_hour(&self) -> Option<f64> {
+        (self.minutes > 0.0).then(|| self.timed_delta.sum * 60.0 / self.minutes)
+    }
+    /// Broader seed-type matching for short cross-season blocks; layout
+    /// matching is retained separately in matched_pace_improvement.
+    pub(crate) fn seed_type_pace_improvement(&self, later: &Self) -> Option<f64> {
+        if self.pace.n < 10 || later.pace.n < 10 {
+            return None;
+        }
+        let mut before = 0.0;
+        let mut after = 0.0;
+        let mut weight = 0.0;
+        for (left, right) in self
+            .seed_pace
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(later.seed_pace.as_chunks::<4>().0.iter())
+        {
+            let an = left.iter().map(|x| x.n).sum::<u64>();
+            let bn = right.iter().map(|x| x.n).sum::<u64>();
+            if an >= 2 && bn >= 2 {
+                let w = an.min(bn) as f64;
+                before += left.iter().map(|x| x.sum).sum::<f64>() / an as f64 * w;
+                after += right.iter().map(|x| x.sum).sum::<f64>() / bn as f64 * w;
+                weight += w;
+            }
+        }
+        (weight >= 10.0 && before > 0.0).then(|| (before - after) / before)
+    }
+    pub(crate) fn matched_pace_improvement(&self, later: &Self) -> Option<f64> {
+        if self.pace.n < 10 || later.pace.n < 10 {
+            return None;
+        }
+        let mut before = 0.0;
+        let mut after = 0.0;
+        let mut weight = 0.0;
+        for (a, b) in self.seed_pace.iter().zip(&later.seed_pace) {
+            if a.n >= 2 && b.n >= 2 {
+                let w = a.n.min(b.n) as f64;
+                before += a.mean()? * w;
+                after += b.mean()? * w;
+                weight += w;
+            }
+        }
+        (weight >= 10.0 && before > 0.0).then(|| (before - after) / before)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ResearchProfile {
+    pub(crate) season: u32,
+    pub(crate) uuid: String,
+    pub(crate) all_games: u64,
+    pub(crate) rank: u8,
+    pub(crate) total: ResearchBlock,
+    pub(crate) first: ResearchBlock,
+    pub(crate) last: ResearchBlock,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ResearchWindow {
+    pub(crate) season: u32,
+    pub(crate) uuid: String,
+    pub(crate) day: u32,
+    pub(crate) rank: u8,
+    pub(crate) before: ResearchBlock,
+    pub(crate) after: ResearchBlock,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ResearchAudit {
+    pub(crate) season: u32,
+    pub(crate) rows: u64,
+    pub(crate) played: u64,
+    pub(crate) flagged: u64,
+    pub(crate) draws: u64,
+    pub(crate) missing_timeline: u64,
+    pub(crate) missing_duration: u64,
+    pub(crate) excluded_death_resets: u64,
+    pub(crate) post_forfeit_deaths: u64,
+    pub(crate) unknown_quit: u64,
+    pub(crate) explicit_quit: u64,
+    pub(crate) skipped: u64,
+    pub(crate) invalid_events: u64,
+    pub(crate) duplicate_ids: u64,
+    pub(crate) continuity_checked: u64,
+    pub(crate) continuity_exact: u64,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RecoveryKey {
+    pub(crate) season: u32, // zero is pooled across available seasons
+    pub(crate) rank: u8,    // seven is pooled across ratings, including unrated
+    pub(crate) kind: u8,
+    pub(crate) view: u8, // 0 rank; 1 split; 2 split deficit; 3 minutes; 4 earlier opponent death
+    pub(crate) bin: i8,
+    pub(crate) behavior: u8, // 0 all deaths (reference); 1 no own forfeit
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct RecoveryCell {
+    pub(crate) key: RecoveryKey,
+    pub(crate) n: u64,
+    pub(crate) wins: u64,
+    pub(crate) completion_wins: u64,
+    pub(crate) players: u64,
+    pub(crate) player_mean: f64,
+    pub(crate) low: f64,
+    pub(crate) high: f64,
+    pub(crate) elo: ResearchMoment,
+    pub(crate) remaining_minutes: f64,
+}
+impl RecoveryCell {
+    pub(crate) fn rate(&self) -> f64 {
+        self.wins as f64 / self.n.max(1) as f64
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct RecoveryTally {
+    n: u64,
+    wins: u64,
+    completion_wins: u64,
+    elo: ResearchMoment,
+    remaining_minutes: f64,
+}
+impl RecoveryTally {
+    fn merge(&mut self, other: &Self) {
+        self.n += other.n;
+        self.wins += other.wins;
+        self.completion_wins += other.completion_wins;
+        self.elo.n += other.elo.n;
+        self.elo.sum += other.elo.sum;
+        self.elo.sum_sq += other.elo.sum_sq;
+        self.remaining_minutes += other.remaining_minutes;
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ResearchEfficiency {
+    pub(crate) season: u32,
+    pub(crate) uuid: String,
+    pub(crate) rank: u8,
+    pub(crate) action: u8, // 0 explicit quit after death; 1 no own forfeit after death
+    pub(crate) stratum: i32,
+    pub(crate) immediate: ResearchMoment,
+    pub(crate) remaining_minutes: f64,
+    pub(crate) horizons: u64,
+    pub(crate) next_delta: f64,
+    pub(crate) next_minutes: f64,
+    pub(crate) session_horizons: u64,
+    pub(crate) session_delta: f64,
+    pub(crate) session_minutes: f64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ResearchCalibration {
+    pub(crate) season: u32,
+    pub(crate) gap: u32,
+    pub(crate) all: bool,
+    pub(crate) n: u64,
+    pub(crate) score: f64,
+    pub(crate) expected: f64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ResearchData {
+    pub(crate) audits: Vec<ResearchAudit>,
+    pub(crate) recovery: Vec<RecoveryCell>,
+    pub(crate) profiles: Vec<ResearchProfile>,
+    pub(crate) windows: Vec<ResearchWindow>,
+    pub(crate) efficiency: Vec<ResearchEfficiency>,
+    pub(crate) calibration: Vec<ResearchCalibration>,
+    pub(crate) opponent_after: Vec<OpponentAfterCell>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OpponentAfterKey {
+    pub(crate) rank: u8,
+    pub(crate) behavior: u8,    // 0 all deaths (reference); 1 no own forfeit
+    pub(crate) prior_death: u8, // 0 no earlier death; 1 earlier death; 2 either
+    pub(crate) kind: u8,        // 0 all; 1 later death; 2 later forfeit; 3 neither;
+                                // 4 death only; 5 forfeit only; 6 both; 7 no later death
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct OpponentAfterCell {
+    pub(crate) key: OpponentAfterKey,
+    pub(crate) opportunities: u64,
+    pub(crate) selected: u64,
+    pub(crate) wins: u64,
+    pub(crate) opportunity_players: u64,
+    pub(crate) selected_players: u64,
+    pub(crate) frequency_low: f64,
+    pub(crate) frequency_high: f64,
+    pub(crate) win_low: f64,
+    pub(crate) win_high: f64,
+}
+impl OpponentAfterCell {
+    pub(crate) fn frequency(&self) -> f64 {
+        self.selected as f64 / self.opportunities.max(1) as f64
+    }
+    pub(crate) fn win_rate(&self) -> f64 {
+        self.wins as f64 / self.selected.max(1) as f64
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct OpponentAfterTally {
+    opportunities: u64,
+    selected: u64,
+    wins: u64,
+}
+impl OpponentAfterTally {
+    fn merge(&mut self, other: Self) {
+        self.opportunities += other.opportunities;
+        self.selected += other.selected;
+        self.wins += other.wins;
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct BinarySquares {
+    success_sq: f64,
+    success_trials: f64,
+    trials_sq: f64,
+    clusters: u64,
+}
+impl BinarySquares {
+    fn add(&mut self, success: u64, trials: u64) {
+        if trials > 0 {
+            let s = success as f64;
+            let n = trials as f64;
+            self.success_sq += s * s;
+            self.success_trials += s * n;
+            self.trials_sq += n * n;
+            self.clusters += 1;
+        }
+    }
+    fn variance(&self, p: f64) -> f64 {
+        (self.success_sq - 2.0 * p * self.success_trials + p * p * self.trials_sq).max(0.0)
+            * self.clusters as f64
+            / self.clusters.saturating_sub(1).max(1) as f64
+    }
+}
+#[derive(Default)]
+struct OpponentAfterMoments {
+    frequency: BinarySquares,
+    winning: BinarySquares,
+}
+impl OpponentAfterMoments {
+    fn add(&mut self, t: OpponentAfterTally) {
+        self.frequency.add(t.selected, t.opportunities);
+        self.winning.add(t.wins, t.selected);
+    }
+}
+#[derive(Default)]
+struct OpponentAfterAggregate {
+    tally: OpponentAfterTally,
+    moments: OpponentAfterMoments,
+}
+fn binary_cluster_interval(
+    success: u64,
+    trials: u64,
+    players: BinarySquares,
+    matches: BinarySquares,
+) -> (f64, f64) {
+    if trials == 0 {
+        return (0.0, 1.0);
+    }
+    let n = trials as f64;
+    let p = success as f64 / n;
+    let pv = players.variance(p);
+    let mv = matches.variance(p);
+    let independent = n * p * (1.0 - p);
+    let variance = (pv + mv - independent).max(pv).max(mv).max(independent) / (n * n);
+    let half = 1.96 * variance.sqrt();
+    let z2 = 1.96f64.powi(2);
+    let center = (p + z2 / (2.0 * n)) / (1.0 + z2 / n);
+    let wilson = 1.96 * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt() / (1.0 + z2 / n);
+    (
+        (p - half).min(center - wilson).max(0.0),
+        (p + half).max(center + wilson).min(1.0),
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct ResearchEvent {
+    time: u32,
+    stage: u8,
+    deficit: i8,
+    opponent_adverse: bool,
+}
+#[derive(Clone, Default)]
+struct ResearchSide {
+    uuid: u128,
+    elo: Option<i32>,
+    delta: Option<i32>,
+    completion: Option<u32>,
+    quit: Option<u32>,
+    events: [Option<ResearchEvent>; 1],
+    deaths: u16,
+    last_death: Option<u32>,
+    nether: Option<u32>,
+}
+#[derive(Clone)]
+struct ResearchMatch {
+    id: i64,
+    date: i64,
+    season: u32,
+    duration: u32,
+    duration_valid: bool,
+    flagged: bool,
+    winner: Option<usize>,
+    seed: Option<usize>,
+    timeline: bool,
+    invalid_events: u64,
+    excluded_death_resets: u64,
+    post_forfeit_deaths: u64,
+    opponent_event_end: u32,
+    sides: [ResearchSide; 2],
+}
+
+fn research_field<'a>(row: &'a Row, name: &str) -> Option<&'a Field> {
+    row.get_column_iter()
+        .find(|(n, _)| n.as_str() == name)
+        .map(|(_, x)| x)
+}
+fn research_int(row: &Row, name: &str) -> Option<i64> {
+    research_field(row, name).and_then(loose_integer)
+}
+fn research_str<'a>(row: &'a Row, name: &str) -> Option<&'a str> {
+    research_field(row, name).and_then(loose_str)
+}
+fn research_list<'a>(row: &'a Row, name: &str) -> &'a [Field] {
+    research_field(row, name)
+        .map(loose_list)
+        .unwrap_or_default()
+}
+fn research_match(row: &Row, requested: Option<&[u32]>) -> Option<ResearchMatch> {
+    if !matches!(research_field(row, "decayed"), Some(Field::Bool(false)))
+        || research_int(row, "type") != Some(2)
+    {
+        return None;
+    }
+    let season = u32::try_from(research_int(row, "season")?).ok()?;
+    if requested.is_some_and(|x| !x.contains(&season)) {
+        return None;
+    }
+    let flagged = match research_field(row, "forfeited")? {
+        Field::Bool(x) => *x,
+        _ => return None,
+    };
+    let result = research_field(row, "result").and_then(loose_group)?;
+    let recorded_duration = research_int(result, "time")
+        .and_then(|x| u32::try_from(x).ok())
+        .filter(|x| *x > 0);
+    let duration_valid = recorded_duration.is_some();
+    // Missing-clock draws are real matches. The fallback is only an event
+    // validation bound, never an observed duration for efficiency estimates.
+    let duration = recorded_duration.unwrap_or_else(|| {
+        research_list(row, "timelines")
+            .iter()
+            .filter_map(loose_group)
+            .filter(|e| research_str(e, "type") != Some("projectelo.timeline.reset"))
+            .filter_map(|e| research_int(e, "time").and_then(|x| u32::try_from(x).ok()))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    });
+    let sides: Vec<_> = research_list(row, "players")
+        .iter()
+        .filter_map(loose_group)
+        .filter_map(|p| research_str(p, "uuid").and_then(parse_uuid))
+        .map(|uuid| ResearchSide {
+            uuid,
+            ..ResearchSide::default()
+        })
+        .collect();
+    if sides.len() != 2 || sides[0].uuid == sides[1].uuid {
+        return None;
+    }
+    let mut sides: [ResearchSide; 2] = sides.try_into().ok()?;
+    let side_of = |uuid: Option<&str>| {
+        uuid.and_then(parse_uuid)
+            .and_then(|x| sides.iter().position(|s| s.uuid == x))
+    };
+    let winner = side_of(research_str(result, "uuid"));
+    if research_str(result, "uuid").is_some() && winner.is_none() {
+        return None;
+    }
+    for change in research_list(row, "changes").iter().filter_map(loose_group) {
+        let index = research_str(change, "uuid")
+            .and_then(parse_uuid)
+            .and_then(|x| sides.iter().position(|s| s.uuid == x));
+        if let Some(i) = index {
+            sides[i].elo = research_int(change, "eloRate").and_then(to_i32);
+            sides[i].delta = research_int(change, "change").and_then(to_i32);
+        }
+    }
+    for completion in research_list(row, "completions")
+        .iter()
+        .filter_map(loose_group)
+    {
+        let index = research_str(completion, "uuid")
+            .and_then(parse_uuid)
+            .and_then(|x| sides.iter().position(|s| s.uuid == x));
+        if let (Some(i), Some(t)) = (
+            index,
+            research_int(completion, "time")
+                .and_then(|x| u32::try_from(x).ok())
+                .filter(|x| *x > 0 && *x <= duration),
+        ) {
+            sides[i].completion = Some(sides[i].completion.map_or(t, |old| old.min(t)));
+        }
+    }
+    let mut events = Vec::new();
+    let mut invalid_events = 0;
+    let mut excluded_death_resets = 0;
+    for e in research_list(row, "timelines")
+        .iter()
+        .filter_map(loose_group)
+    {
+        let index = research_str(e, "uuid")
+            .and_then(parse_uuid)
+            .and_then(|x| sides.iter().position(|s| s.uuid == x));
+        let time = research_int(e, "time").and_then(|x| u32::try_from(x).ok());
+        let (Some(i), Some(t), Some(kind)) = (index, time, research_str(e, "type")) else {
+            invalid_events += 1;
+            continue;
+        };
+        if t > duration {
+            invalid_events += 1;
+            continue;
+        }
+        if kind == "projectelo.timeline.death_spawnpoint" {
+            excluded_death_resets += 1;
+            continue;
+        }
+        let code = match kind {
+            "projectelo.timeline.death" => 0,
+            "projectelo.timeline.forfeit" => 3,
+            "story.enter_the_nether" => 4,
+            "nether.find_bastion" => 5,
+            "nether.find_fortress" => 6,
+            "projectelo.timeline.blind_travel" => 7,
+            "story.follow_ender_eye" => 8,
+            "story.enter_the_end" => 9,
+            _ => continue,
+        };
+        events.push((t, i, code));
+    }
+    events.sort_unstable();
+    // A forfeit ends the shared match. Never treat later recorded events as
+    // opportunities observed while the match was still being played.
+    let first_forfeit = events.iter().find(|(_, _, code)| *code == 3).map(|e| e.0);
+    let opponent_event_end = first_forfeit
+        .into_iter()
+        .chain(sides.iter().filter_map(|s| s.completion))
+        .fold(duration, u32::min);
+    let mut post_forfeit_deaths = 0;
+    let mut stages = [0u8; 2];
+    let mut adverse = [false; 2];
+    for (t, i, code) in events {
+        post_forfeit_deaths += u64::from(code == 0 && first_forfeit.is_some_and(|q| t > q));
+        if t > opponent_event_end {
+            continue;
+        }
+        if code == 3 {
+            sides[i].quit = Some(sides[i].quit.map_or(t, |old| old.min(t)));
+        } else if code == 0 {
+            if t < opponent_event_end {
+                let e = ResearchEvent {
+                    time: t,
+                    stage: stages[i],
+                    deficit: stages[1 - i] as i8 - stages[i] as i8,
+                    opponent_adverse: adverse[1 - i],
+                };
+                sides[i].events[code].get_or_insert(e);
+                adverse[i] = true;
+            }
+            sides[i].deaths = sides[i].deaths.saturating_add(1);
+            sides[i].last_death = Some(t);
+        } else {
+            stages[i] = stages[i].max((code - 3) as u8);
+            if code == 4 && sides[i].nether.is_none() {
+                sides[i].nether = Some(t);
+            }
+        }
+    }
+    let seed_group = research_field(row, "seed").and_then(loose_group);
+    let seed_type = research_str(row, "seedType")
+        .or_else(|| seed_group.and_then(|x| research_str(x, "overworld")));
+    let bastion_type = research_str(row, "bastionType")
+        .or_else(|| seed_group.and_then(|x| research_str(x, "nether")));
+    let seed = seed_type
+        .and_then(|x| SEED_TYPES.iter().position(|y| *y == x))
+        .zip(bastion_type.and_then(|x| BASTION_TYPES.iter().position(|y| *y == x)))
+        .map(|(a, b)| a * 4 + b);
+    Some(ResearchMatch {
+        id: research_int(row, "id")?,
+        date: research_int(row, "date")?,
+        season,
+        duration,
+        duration_valid,
+        flagged,
+        winner,
+        seed,
+        timeline: !research_list(row, "timelines").is_empty(),
+        invalid_events,
+        excluded_death_resets,
+        post_forfeit_deaths,
+        opponent_event_end,
+        sides,
+    })
+}
+
+fn research_block(history: &[(&ResearchMatch, usize)]) -> ResearchBlock {
+    let mut b = ResearchBlock::default();
+    for (m, i) in history {
+        let s = &m.sides[*i];
+        b.games += 1;
+        b.quits += u64::from(s.quit.is_some());
+        b.wins += u64::from(m.winner == Some(*i));
+        b.deaths += u64::from(s.deaths > 0);
+        b.death_matches += u64::from(s.events[0].is_some());
+        b.continued_after_death += u64::from(s.events[0].is_some() && s.quit.is_none());
+        if let Some(elo) = s.elo {
+            b.elo.add(f64::from(elo));
+        }
+        if let Some(delta) = s.delta {
+            b.delta.add(f64::from(delta));
+        }
+        if let (Some(own), Some(other)) = (s.elo, m.sides[1 - *i].elo) {
+            let score = m.winner.map_or(0.5, |w| f64::from(w == *i));
+            b.residual.add(score - expected_score(own, other));
+        }
+        if m.duration_valid {
+            b.minutes += f64::from(m.duration) / 60_000.0;
+            if let Some(delta) = s.delta {
+                b.timed_delta.add(f64::from(delta));
+            }
+        }
+        if let Some(t) = s.completion {
+            b.pace.add(f64::from(t) / 1000.0);
+            if let Some(seed) = m.seed {
+                b.seed_pace[seed].add(f64::from(t) / 1000.0);
+            }
+        }
+        if let Some(t) = s.nether {
+            b.nether.add(f64::from(t) / 1000.0);
+        }
+    }
+    b
+}
+
+/// Shared, source-fingerprinted measurements. The compact JSON cache and each
+/// analysis's CSV follow --output into the containing directory. Old artifacts
+/// are never deleted. Version changes invalidate cached measurement semantics.
+pub(crate) fn load_research(input: &AnalysisInput<'_>) -> Result<ResearchData, Box<dyn Error>> {
+    let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+    "forfeit-research-v9-death-only-continuation".hash(&mut fingerprint);
+    input.seasons().hash(&mut fingerprint);
+    for file in input.files() {
+        std::fs::canonicalize(&file.path)?.hash(&mut fingerprint);
+        let meta = std::fs::metadata(&file.path)?;
+        meta.len().hash(&mut fingerprint);
+        meta.modified()?.hash(&mut fingerprint);
+    }
+    let cache = input.output().sibling(&format!(
+        "forfeit_research_{:016x}.json.zst",
+        fingerprint.finish()
+    ));
+    if cache.is_file() {
+        return Ok(serde_json::from_reader(BufReader::new(
+            zstd::stream::read::Decoder::new(File::open(cache)?)?,
+        ))?);
+    }
+    let mut work = Vec::new();
+    for file in input.files() {
+        let reader = open(&file.path)?;
+        let mut paths: Vec<Vec<&str>> = DUEL_COLUMNS
+            .iter()
+            .filter(|x| !x.ends_with("country") && !x.ends_with("nickname"))
+            .map(|x| x.split('.').collect())
+            .collect();
+        paths.extend([
+            vec!["type"],
+            vec!["completions", "list", "element", "time"],
+            vec!["completions", "list", "element", "uuid"],
+        ]);
+        let projection = project_schema(reader.metadata().file_metadata().schema(), &paths, 0)
+            .ok_or_else(|| io::Error::other("no research columns"))?;
+        for index in 0..reader.num_row_groups() {
+            if row_group_matches(&reader, index, input.seasons()) {
+                work.push((&file.path, index, projection.clone()));
+            }
+        }
+    }
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    let chunks: Result<Vec<_>, io::Error> = pool.install(|| {
+        work.into_par_iter()
+            .map(|(path, index, projection)| {
+                let reader = open(path).map_err(|e| io::Error::other(e.to_string()))?;
+                let rows = reader.get_row_group(index).map_err(io::Error::other)?;
+                let mut matches = Vec::new();
+                let mut audits: BTreeMap<u32, ResearchAudit> = BTreeMap::new();
+                for row in rows
+                    .get_row_iter(Some(projection))
+                    .map_err(io::Error::other)?
+                {
+                    let row = row.map_err(io::Error::other)?;
+                    let Some(season) =
+                        research_int(&row, "season").and_then(|x| u32::try_from(x).ok())
+                    else {
+                        continue;
+                    };
+                    if !input.includes_season(season) {
+                        continue;
+                    }
+                    let a = audits.entry(season).or_insert_with(|| ResearchAudit {
+                        season,
+                        ..ResearchAudit::default()
+                    });
+                    a.rows += 1;
+                    if !matches!(research_field(&row, "decayed"), Some(Field::Bool(false))) {
+                        continue;
+                    }
+                    if let Some(m) = research_match(&row, input.seasons()) {
+                        matches.push(m);
+                    } else {
+                        a.skipped += 1;
+                    }
+                }
+                Ok((matches, audits))
+            })
+            .collect()
+    });
+    let mut matches = Vec::new();
+    let mut audits: BTreeMap<u32, ResearchAudit> = BTreeMap::new();
+    for (chunk, counts) in chunks? {
+        matches.extend(chunk);
+        for (season, a) in counts {
+            let target = audits.entry(season).or_insert_with(|| ResearchAudit {
+                season,
+                ..ResearchAudit::default()
+            });
+            target.rows += a.rows;
+            target.skipped += a.skipped;
+        }
+    }
+    matches.sort_unstable_by_key(|m| (m.season, m.id));
+    let mut seen = HashSet::new();
+    matches.retain(|m| {
+        if seen.insert((m.season, m.id)) {
+            true
+        } else {
+            audits.entry(m.season).or_default().duplicate_ids += 1;
+            false
+        }
+    });
+    drop(seen);
+    matches.sort_unstable_by_key(|m| (m.season, m.date, m.id));
+    let mut histories: BTreeMap<(u32, u128), Vec<(&ResearchMatch, usize)>> = BTreeMap::new();
+    let mut player_cells: HashMap<(RecoveryKey, u128), RecoveryTally> = HashMap::new();
+    let mut match_squares: HashMap<RecoveryKey, (f64, f64, f64, u64)> = HashMap::new();
+    let mut calibration: BTreeMap<(u32, u32, bool), ResearchCalibration> = BTreeMap::new();
+    let mut opponent_players: HashMap<(OpponentAfterKey, u128), OpponentAfterTally> =
+        HashMap::new();
+    let mut opponent_matches: HashMap<OpponentAfterKey, OpponentAfterMoments> = HashMap::new();
+    for m in &matches {
+        let a = audits.entry(m.season).or_default();
+        a.played += 1;
+        a.flagged += u64::from(m.flagged);
+        a.draws += u64::from(m.winner.is_none());
+        a.missing_timeline += u64::from(!m.timeline);
+        a.missing_duration += u64::from(!m.duration_valid);
+        a.invalid_events += m.invalid_events;
+        a.excluded_death_resets += m.excluded_death_resets;
+        a.post_forfeit_deaths += m.post_forfeit_deaths;
+        a.explicit_quit += u64::from(m.sides.iter().any(|s| s.quit.is_some()));
+        a.unknown_quit +=
+            u64::from(m.flagged && m.winner.is_some() && m.sides.iter().all(|s| s.quit.is_none()));
+        if a.start == 0 || m.date < a.start {
+            a.start = m.date;
+        }
+        a.end = a.end.max(m.date);
+        if let (Some(own), Some(other)) = (m.sides[0].elo, m.sides[1].elo) {
+            let gap = (own - other).unsigned_abs();
+            if gap < 500 {
+                let favorite = usize::from(other > own);
+                for season in [0, m.season] {
+                    for all in [false, true] {
+                        if !all && m.flagged {
+                            continue;
+                        }
+                        let c = calibration.entry((season, gap / 50, all)).or_insert(
+                            ResearchCalibration {
+                                season,
+                                gap: gap / 50,
+                                all,
+                                n: 0,
+                                score: 0.0,
+                                expected: 0.0,
+                            },
+                        );
+                        c.n += 1;
+                        c.score += m.winner.map_or(0.5, |w| f64::from(w == favorite));
+                        c.expected += expected_score(own.max(other), own.min(other));
+                    }
+                }
+            }
+        }
+        let mut in_match: HashMap<RecoveryKey, (f64, f64)> = HashMap::new();
+        let mut opponent_in_match: HashMap<OpponentAfterKey, OpponentAfterTally> = HashMap::new();
+        for (i, s) in m.sides.iter().enumerate() {
+            histories
+                .entry((m.season, s.uuid))
+                .or_default()
+                .push((m, i));
+            if let Some(e) = s.events[0].filter(|e| e.time < m.opponent_event_end) {
+                let other = &m.sides[1 - i];
+                let later_death = other.last_death.is_some_and(|t| t > e.time);
+                let later_forfeit = other
+                    .quit
+                    .is_some_and(|t| t > e.time && t <= m.opponent_event_end);
+                let prior = u8::from(other.events[0].is_some_and(|d| d.time < e.time));
+                let selected = [
+                    true,
+                    later_death,
+                    later_forfeit,
+                    !later_death && !later_forfeit,
+                    later_death && !later_forfeit,
+                    !later_death && later_forfeit,
+                    later_death && later_forfeit,
+                    !later_death,
+                ];
+                for rank in [research_rank(s.elo), 7] {
+                    for behavior in [0, 1] {
+                        if behavior == 1 && s.quit.is_some() {
+                            continue;
+                        }
+                        for (prior_death, kind) in (0..8u8)
+                            .map(|kind| (2, kind))
+                            .chain([(prior, 1), (prior, 7)])
+                        {
+                            let key = OpponentAfterKey {
+                                rank,
+                                behavior,
+                                prior_death,
+                                kind,
+                            };
+                            let present = u64::from(selected[kind as usize]);
+                            let t = OpponentAfterTally {
+                                opportunities: 1,
+                                selected: present,
+                                wins: present * u64::from(m.winner == Some(i)),
+                            };
+                            opponent_players.entry((key, s.uuid)).or_default().merge(t);
+                            opponent_in_match.entry(key).or_default().merge(t);
+                        }
+                    }
+                }
+            }
+            for (kind, event) in s.events.iter().enumerate() {
+                let Some(e) = event else {
+                    continue;
+                };
+                let won = m.winner == Some(i);
+                let own_quit = s.quit.is_some();
+                for (season, rank, view, bin) in [
+                    (0, research_rank(s.elo), 0, 0),
+                    (0, 7, 0, 0),
+                    (m.season, 7, 0, 0),
+                    (0, 7, 1, e.stage as i8),
+                    (0, 7, 2, e.deficit.clamp(-2, 2)),
+                    (0, research_rank(s.elo), 2, e.deficit.clamp(-2, 2)),
+                    (0, 7, 3, (e.time / 180_000).min(8) as i8),
+                    (0, 7, 4, i8::from(e.opponent_adverse)),
+                ] {
+                    for behavior in 0..2 {
+                        if behavior == 1 && own_quit {
+                            continue;
+                        }
+                        let key = RecoveryKey {
+                            season,
+                            rank,
+                            kind: kind as u8,
+                            view,
+                            bin,
+                            behavior,
+                        };
+                        let t = player_cells.entry((key, s.uuid)).or_default();
+                        t.n += 1;
+                        t.wins += u64::from(won);
+                        t.completion_wins += u64::from(won && s.completion.is_some());
+                        if let Some(delta) = s.delta {
+                            t.elo.add(f64::from(delta));
+                        }
+                        t.remaining_minutes += f64::from(m.duration - e.time) / 60_000.0;
+                        let counts = in_match.entry(key).or_default();
+                        counts.0 += 1.0;
+                        counts.1 += f64::from(won);
+                    }
+                }
+            }
+        }
+        for (key, (n, w)) in in_match {
+            let sq = match_squares.entry(key).or_default();
+            sq.0 += w * w;
+            sq.1 += w * n;
+            sq.2 += n * n;
+            sq.3 += 1;
+        }
+        for (key, t) in opponent_in_match {
+            opponent_matches.entry(key).or_default().add(t);
+        }
+    }
+    let mut opponent_aggregate: HashMap<OpponentAfterKey, OpponentAfterAggregate> = HashMap::new();
+    for ((key, _), t) in opponent_players {
+        let a = opponent_aggregate.entry(key).or_default();
+        a.tally.merge(t);
+        a.moments.add(t);
+    }
+    let mut opponent_after = Vec::new();
+    for (key, a) in opponent_aggregate {
+        let m = &opponent_matches[&key];
+        let t = a.tally;
+        let (frequency_low, frequency_high) = binary_cluster_interval(
+            t.selected,
+            t.opportunities,
+            a.moments.frequency,
+            m.frequency,
+        );
+        let (win_low, win_high) =
+            binary_cluster_interval(t.wins, t.selected, a.moments.winning, m.winning);
+        opponent_after.push(OpponentAfterCell {
+            key,
+            opportunities: t.opportunities,
+            selected: t.selected,
+            wins: t.wins,
+            opportunity_players: a.moments.frequency.clusters,
+            selected_players: a.moments.winning.clusters,
+            frequency_low,
+            frequency_high,
+            win_low,
+            win_high,
+        });
+    }
+    opponent_after
+        .sort_unstable_by_key(|c| (c.key.rank, c.key.behavior, c.key.prior_death, c.key.kind));
+    let mut aggregate: HashMap<RecoveryKey, (RecoveryTally, u64, f64, f64, f64, f64)> =
+        HashMap::new();
+    for ((key, _), t) in player_cells {
+        let x = aggregate.entry(key).or_default();
+        x.0.merge(&t);
+        x.1 += 1;
+        x.2 += (t.wins as f64).powi(2);
+        x.3 += t.wins as f64 * t.n as f64;
+        x.4 += (t.n as f64).powi(2);
+        x.5 += t.wins as f64 / t.n as f64;
+    }
+    let mut recovery = Vec::new();
+    for (key, (t, g, w2, wn, n2, means)) in aggregate {
+        let n = t.n as f64;
+        let p = t.wins as f64 / n;
+        let player_var = (w2 - 2.0 * p * wn + p * p * n2).max(0.0) * g as f64
+            / (g.saturating_sub(1).max(1) as f64);
+        let (mw2, mwn, mn2, mg) = match_squares[&key];
+        let match_var = (mw2 - 2.0 * p * mwn + p * p * mn2).max(0.0) * mg as f64
+            / (mg.saturating_sub(1).max(1) as f64);
+        let independent = n * p * (1.0 - p);
+        // Conservative two-way player/match sandwich, never narrower than
+        // either one-way cluster estimate or the independent Bernoulli floor.
+        let variance = (player_var + match_var - independent)
+            .max(player_var)
+            .max(match_var)
+            .max(independent)
+            / (n * n);
+        let half = 1.96 * variance.sqrt();
+        let z2 = 1.96f64.powi(2);
+        let center = (p + z2 / (2.0 * n)) / (1.0 + z2 / n);
+        let wilson = 1.96 * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt() / (1.0 + z2 / n);
+        recovery.push(RecoveryCell {
+            key,
+            n: t.n,
+            wins: t.wins,
+            completion_wins: t.completion_wins,
+            players: g,
+            player_mean: means / g as f64,
+            low: (p - half).min(center - wilson).max(0.0),
+            high: (p + half).max(center + wilson).min(1.0),
+            elo: t.elo,
+            remaining_minutes: t.remaining_minutes,
+        });
+    }
+    recovery.sort_unstable_by_key(|x| {
+        (
+            x.key.season,
+            x.key.rank,
+            x.key.kind,
+            x.key.view,
+            x.key.bin,
+            x.key.behavior,
+        )
+    });
+    let mut profiles = Vec::new();
+    let mut windows = Vec::new();
+    let mut efficiency = Vec::new();
+    for ((season, uuid), history) in histories {
+        let rated: Vec<_> = history
+            .iter()
+            .copied()
+            .filter(|(m, i)| m.sides[*i].elo.is_some() && m.sides[*i].delta.is_some())
+            .collect();
+        for pair in rated.windows(2) {
+            let (a, i) = pair[0];
+            let (b, j) = pair[1];
+            let audit = audits.get_mut(&season).expect("season already audited");
+            audit.continuity_checked += 1;
+            audit.continuity_exact += u64::from(
+                a.sides[i].elo.zip(a.sides[i].delta).map(|(x, y)| x + y) == b.sides[j].elo,
+            );
+        }
+        if rated.is_empty() {
+            continue;
+        }
+        let total = research_block(&rated);
+        profiles.push(ResearchProfile {
+            season,
+            uuid: format!("{uuid:032x}"),
+            all_games: history.len() as u64,
+            rank: research_rank(total.elo.mean().map(|x| x as i32)),
+            first: research_block(&rated[..rated.len().min(50)]),
+            last: research_block(&rated[rated.len().saturating_sub(50)..]),
+            total,
+        });
+        let audit = &audits[&season];
+        for day in [30, 60, 90] {
+            let anchor = audit.start + i64::from(day) * 86_400;
+            // A full calendar follow-up must be present; partial season 12 is
+            // intentionally excluded from the 30-day improvement cohorts.
+            if anchor + 30 * 86_400 > audit.end {
+                continue;
+            }
+            let split = rated.partition_point(|(m, _)| m.date < anchor);
+            if split < 50 || rated[split - 1].0.date < anchor - 14 * 86_400 {
+                continue;
+            }
+            let end = rated.partition_point(|(m, _)| m.date < anchor + 30 * 86_400);
+            let before = research_block(&rated[split - 50..split]);
+            let (last, side) = rated[split - 1];
+            let rank = research_rank(
+                last.sides[side]
+                    .elo
+                    .zip(last.sides[side].delta)
+                    .map(|(x, y)| x + y),
+            );
+            windows.push(ResearchWindow {
+                season,
+                uuid: format!("{uuid:032x}"),
+                day,
+                rank,
+                before,
+                after: research_block(&rated[split..end]),
+            });
+        }
+        let mut groups: BTreeMap<(u8, u8, i32), ResearchEfficiency> = BTreeMap::new();
+        for (index, (m, i)) in rated.iter().enumerate() {
+            if !m.duration_valid {
+                continue;
+            }
+            let s = &m.sides[*i];
+            let Some(e) = s.events[0] else {
+                continue;
+            };
+            let action = u8::from(s.quit.is_none());
+            let rank = research_rank(s.elo);
+            let Some(other) = m.sides[1 - *i].elo else {
+                continue;
+            };
+            let gap = ((s.elo.unwrap_or(0) - other).div_euclid(100)).clamp(-3, 3) + 3;
+            let own_band = s.elo.unwrap_or(0).div_euclid(100);
+            let stratum = own_band * 1000
+                + gap * 100
+                + i32::from(e.stage) * 10
+                + i32::from(e.deficit.clamp(-2, 2) + 2);
+            let group =
+                groups
+                    .entry((rank, action, stratum))
+                    .or_insert_with(|| ResearchEfficiency {
+                        season,
+                        uuid: format!("{uuid:032x}"),
+                        rank,
+                        action,
+                        stratum,
+                        immediate: ResearchMoment::default(),
+                        remaining_minutes: 0.0,
+                        horizons: 0,
+                        next_delta: 0.0,
+                        next_minutes: 0.0,
+                        session_horizons: 0,
+                        session_delta: 0.0,
+                        session_minutes: 0.0,
+                    });
+            group.immediate.add(f64::from(s.delta.unwrap_or(0)));
+            group.remaining_minutes += f64::from(m.duration - e.time) / 60_000.0;
+            if index + 10 <= rated.len()
+                && rated[index..index + 10]
+                    .iter()
+                    .all(|(game, _)| game.duration_valid)
+            {
+                let next = research_block(&rated[index + 1..index + 10]);
+                group.horizons += 1;
+                group.next_delta += f64::from(s.delta.unwrap_or(0)) + next.delta.sum;
+                group.next_minutes += f64::from(m.duration - e.time) / 60_000.0 + next.minutes;
+                let slice = &rated[index..index + 10];
+                let same_session = slice.windows(2).all(|p| {
+                    p[1].0.date
+                        <= p[0].0.date + i64::from(p[0].0.duration / 1000) + SESSION_GAP_SECONDS
+                });
+                if same_session {
+                    group.session_horizons += 1;
+                    group.session_delta += f64::from(s.delta.unwrap_or(0)) + next.delta.sum;
+                    group.session_minutes +=
+                        f64::from(m.duration - e.time) / 60_000.0 + next.minutes;
+                }
+            }
+        }
+        efficiency.extend(groups.into_values());
+    }
+    let data = ResearchData {
+        audits: audits.into_values().collect(),
+        recovery,
+        profiles,
+        windows,
+        efficiency,
+        calibration: calibration.into_values().collect(),
+        opponent_after,
+    };
+    crate::plot::create_parent(&cache)?;
+    // Write a new cache only after a complete successful computation.
+    let temporary = cache.with_extension(format!("zst.{}.partial", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let mut writer = BufWriter::new(zstd::stream::write::Encoder::new(file, 1)?);
+    serde_json::to_writer(&mut writer, &data)?;
+    writer.flush()?;
+    writer.into_inner().map_err(|e| e.into_error())?.finish()?;
+    std::fs::rename(temporary, &cache)?;
+    Ok(data)
+}
+
+/// Equal-weight player-season/cohort means with UUID-clustered uncertainty.
+/// Shared by the habit, learning and retention plots. Samples are not treated
+/// as independent merely because the same UUID appeared in another season.
+#[derive(Clone)]
+pub(crate) struct ResearchObservation {
+    pub(crate) uuid: String,
+    pub(crate) rank: u8,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) stratum: String,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct ResearchEstimate {
+    pub(crate) x: f64,
+    pub(crate) mean: f64,
+    pub(crate) low: f64,
+    pub(crate) high: f64,
+    pub(crate) n: u64,
+    pub(crate) players: u64,
+}
+pub(crate) fn research_estimates(
+    samples: &[ResearchObservation],
+    rank: u8,
+) -> Vec<ResearchEstimate> {
+    let mut bins: BTreeMap<u8, HashMap<&str, (f64, u64)>> = BTreeMap::new();
+    for s in samples
+        .iter()
+        .filter(|s| s.rank == rank && s.x.is_finite() && s.y.is_finite())
+    {
+        let bin = ((s.x * 10.0).floor() as u8).min(9);
+        let t = bins.entry(bin).or_default().entry(&s.uuid).or_default();
+        t.0 += s.y;
+        t.1 += 1;
+    }
+    bins.into_iter()
+        .filter_map(|(bin, players)| {
+            if players.len() < 20 {
+                return None;
+            }
+            let n: u64 = players.values().map(|x| x.1).sum();
+            let mean = players.values().map(|x| x.0).sum::<f64>() / n as f64;
+            let g = players.len() as u64;
+            let var = players
+                .values()
+                .map(|(sum, count)| (sum - mean * (*count as f64)).powi(2))
+                .sum::<f64>()
+                * g as f64
+                / (g - 1) as f64
+                / (n as f64).powi(2);
+            let half = 1.96 * var.sqrt();
+            Some(ResearchEstimate {
+                x: (f64::from(bin) + 0.5) / 10.0,
+                mean,
+                low: mean - half,
+                high: mean + half,
+                n,
+                players: g,
+            })
+        })
+        .collect()
+}
+/// Removes predefined baseline-stratum means from the plotted outcome. The
+/// regression itself demeans both exposure and outcome, with UUID clustering.
+pub(crate) fn research_center(samples: &mut Vec<ResearchObservation>) -> Option<(f64, f64)> {
+    let mut exposure_variation: HashMap<String, (u64, f64, f64)> = HashMap::new();
+    for s in samples.iter() {
+        let t = exposure_variation.entry(s.stratum.clone()).or_default();
+        t.0 += 1;
+        t.1 += s.x;
+        t.2 += s.x * s.x;
+    }
+    samples.retain(|s| {
+        let (n, sum, sq) = exposure_variation[&s.stratum];
+        n >= 2 && sq - sum * sum / n as f64 > 1e-12
+    });
+    drop(exposure_variation);
+    let mut strata: HashMap<&str, (f64, f64, u64)> = HashMap::new();
+    for s in samples.iter() {
+        let t = strata.entry(&s.stratum).or_default();
+        t.0 += s.x;
+        t.1 += s.y;
+        t.2 += 1;
+    }
+    let mut residuals = Vec::with_capacity(samples.len());
+    let mut xx = 0.0;
+    let mut xy = 0.0;
+    for s in samples.iter() {
+        let (x, y, n) = strata[&s.stratum.as_str()];
+        let dx = s.x - x / n as f64;
+        let dy = s.y - y / n as f64;
+        xx += dx * dx;
+        xy += dx * dy;
+        residuals.push((dx, dy));
+    }
+    drop(strata);
+    if xx <= 1e-12 {
+        return None;
+    }
+    let slope = xy / xx;
+    let mut scores: HashMap<&str, f64> = HashMap::new();
+    for (s, (x, y)) in samples.iter().zip(&residuals) {
+        *scores.entry(&s.uuid).or_default() += x * (y - slope * x);
+    }
+    let g = scores.len();
+    let se = (scores.values().map(|x| x * x).sum::<f64>() * (g as f64)
+        / (g.saturating_sub(1).max(1) as f64)
+        / (xx * xx))
+        .sqrt();
+    drop(scores);
+    for (s, (_, y)) in samples.iter_mut().zip(residuals) {
+        s.y = y;
+    }
+    Some((slope, se))
+}
+pub(crate) fn research_csv(
+    path: &Path,
+    header: &str,
+    rows: impl IntoIterator<Item = String>,
+) -> io::Result<()> {
+    crate::plot::create_parent(path)?;
+    let mut writer = BufWriter::new(File::create(path)?);
+    writeln!(writer, "{header}")?;
+    for row in rows {
+        writeln!(writer, "{row}")?;
+    }
+    writer.flush()
 }

@@ -14,9 +14,9 @@ elo-versus-games, elo-versus-win-duration, name-underscores-versus-elo, elo-dist
 sampled-winrate-over-time, \
 split-evolution, win-time-distribution, season-retention, veteran-edge, elo-percentiles-by-season, elo-calibration, upsets-by-elo, \
 peak-versus-final, top-ten-trajectories, grind-curve, streak-winrate, session-fatigue, quit-after-loss, weekday-hour-heatmap, \
-matchmaking-gap-by-hour, elo-by-hour, milestone-lead-winrate, deaths-versus-elo, seed-bastion-win-time, country-elo\n\nEach analysis runs on its own \
+matchmaking-gap-by-hour, elo-by-hour, milestone-lead-winrate, deaths-versus-elo, seed-bastion-win-time, country-elo, recovery-winrate, recovery-seasons, recovery-stage, recovery-deficit, recovery-opponent, opponent-after-death, opponent-after-death-winrate, opponent-death-timing, death-rank-deficit, recovery-time, death-reset-exclusions, recovery-outcomes, forfeit-coverage, forfeit-calibration, forfeit-rating, forfeit-winrate, forfeit-residual, forfeit-pace, forfeit-completion, forfeit-improvement, forfeit-hour-improvement, forfeit-pace-improvement, recovery-improvement, forfeit-death-improvement, recovery-pace-improvement, forfeit-retention, forfeit-cross-season-pace, forfeit-cross-season-rating, recovery-elo, recovery-efficiency\n\nEach analysis runs on its own \
 and renders one plot: single-output analyses write one chart spanning the selected seasons, per-season analyses one PNG per season. All analyses exclude decayed and forfeited matches by default, except \
-games-per-hour and hour-entropy, which describe when matches are played rather than how they ended and so keep forfeited matches.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
+the explicitly requested recovery/forfeit research plots, which keep real forfeited games to study recovery, and games-per-hour and hour-entropy, which describe when matches are played rather than how they ended and so keep forfeited matches.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
 )]
 struct Cli {
     /// Parquet file or directory to analyze.

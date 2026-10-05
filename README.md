@@ -4,8 +4,8 @@
 selected seasons. It is both a small command-line application and a library for
 the source-record schema exposed by [`rankewd::schema`](src/schema.rs). Curated
 datasets contain only `type = 2` matches, and every analysis excludes decayed
-and forfeited matches by default. The two hour-of-day analyses are the
-documented exception: they keep forfeited matches and drop only decayed ones.
+and forfeited matches by default. The two hour-of-day analyses and the explicitly requested forfeit/recovery
+research are documented exceptions: they retain forfeits and drop decay.
 
 ## Repository layout
 
@@ -46,7 +46,7 @@ direnv allow
 ```
 
 If direnv is not available, use `nix develop`. The shell supplies Rust,
-fontconfig, and **Lilex Nerd Font** for chart rendering.
+and fontconfig. Chart rendering uses the installed **SF Pro Text** family.
 
 Useful commands:
 
@@ -156,3 +156,68 @@ A session ends when a player starts no match within 30 minutes of their
 previous match ending. Win rates "vs Elo expectation" subtract the logistic
 400-point Elo prediction from the outcome, so they isolate what the rating does
 not already explain.
+
+
+## Forfeit research
+
+Run the main study on seasons 10 and 11:
+
+```sh
+bash scripts/run-forfeit-research.sh
+```
+
+The script writes 30 main graphs restricted to seasons 10–11, one separately
+labeled all-season recovery comparison, CSVs,
+individual CLI reports and a shared measurement cache to `output/research/`.
+It also assembles an illustrated report in `report.md` and `index.html`,
+with every relevant graph beside its discussion, using `scripts/build_research_report.py`. Set
+`RANKEWD_RESEARCH_OUTPUT` to relocate that complete family. The findings builder
+requires a main measurement cache restricted to seasons 10 and 11. The script also generates a separate all-season report under
+`output/research/all_seasons/`, including three partial-season-12 figures. Titles, labels, legends, and reports use ASD-STE100 writing rules and defined
+technical terms. All recovery and `opponent-*` plots restrict
+their main cohort to first ordinary deaths with no recorded own forfeit, without
+requiring another split. Observation ends at the first completion or forfeit,
+even if later events are present in the timeline. World resets are ignored in
+every research measurement. The Elo-efficiency
+comparison also starts at death and retains forfeiting as the comparison action;
+habit analyses retain rated matches to measure forfeit rates. Both opponent-event
+curves use the same cohort; they do not compare forfeiting against continued play. Each
+plot also has its own `--analysis` name:
+
+- `recovery-winrate`
+- `recovery-seasons`
+- `recovery-stage`
+- `recovery-deficit`
+- `recovery-opponent`
+- `opponent-after-death`
+- `opponent-after-death-winrate`
+- `opponent-death-timing`
+- `death-rank-deficit`
+- `recovery-time`
+- `death-reset-exclusions`
+- `recovery-outcomes`
+- `forfeit-coverage`
+- `forfeit-rating`
+- `forfeit-winrate`
+- `forfeit-residual`
+- `forfeit-pace`
+- `forfeit-completion`
+- `forfeit-improvement`
+- `forfeit-hour-improvement`
+- `forfeit-pace-improvement`
+- `recovery-improvement`
+- `forfeit-death-improvement`
+- `recovery-pace-improvement`
+- `forfeit-retention`
+- `forfeit-cross-season-pace`
+- `forfeit-cross-season-rating`
+- `recovery-elo`
+- `recovery-efficiency`
+- `forfeit-calibration`
+
+These analyses deliberately include real forfeited matches, as required for
+recovery and quit-habit research; existing analyses keep their default filters.
+See [the dataset documentation](docs/dataset-format.md#forfeit-and-recovery-research)
+for definitions, eligibility, uncertainty and observational limits, and
+[JSONL conversion](docs/dataset-format.md#converting-source-jsonl-exports) for
+importing missing seasons.
