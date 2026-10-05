@@ -44,6 +44,27 @@ selects which chart is drawn:
   match.
 - `sampled_winrate_over_time.rs` charts the evenly spaced snapshots of a
   reproducible player sample.
+- Twenty playerbase plots read the shared two-player match loader:
+  `split_evolution.rs`, `win_time_distribution.rs`, `season_retention.rs`,
+  `veteran_edge.rs`, `elo_percentiles_by_season.rs`, `elo_calibration.rs`,
+  `upsets_by_elo.rs`, `peak_versus_final.rs`, `top_ten_trajectories.rs`,
+  `grind_curve.rs`, `streak_winrate.rs`, `session_fatigue.rs`,
+  `quit_after_loss.rs`, `weekday_hour_heatmap.rs`,
+  `matchmaking_gap_by_hour.rs`, `elo_by_hour.rs`,
+  `milestone_lead_winrate.rs`, `deaths_versus_elo.rs`,
+  `seed_bastion_win_time.rs`, and `country_elo.rs`. The README lists what each
+  one shows.
+
+The playerbase plots share `dataset::load_duels`, which reads every selected
+file in parallel with a projection built from each file's own schema, since
+older seasons store some columns with other types (season 1 keeps
+`changes.eloRate` as a double) or omit them. It keeps non-decayed,
+non-forfeited matches between two distinct players, orders them by date and
+ID, and records each side's pre-match Elo and change from `changes`, its
+country, and, when requested, the first time of each route milestone and its
+death count from `timelines`. `dataset::session_slots` splits a player's
+matches into sessions separated by 30 idle minutes. Shared line-chart,
+heatmap-color, and axis helpers for these plots live in `src/plot.rs`.
 
 There are no analysis-specific style, utility, or output submodules. Shared
 Parquet concerns, including the player-season and match-history aggregation the

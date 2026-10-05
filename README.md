@@ -24,11 +24,13 @@ documented exception: they keep forfeited matches and drop only decayed ones.
   (`elo-versus-win-duration`), `name_underscores_versus_elo.rs`
   (`name-underscores-versus-elo`), `winrate_versus_elo.rs`
   (`winrate-versus-elo`), `winrate_over_time.rs` (`winrate-over-time`), and
-  `sampled_winrate_over_time.rs` (`sampled-winrate-over-time`).
+  `sampled_winrate_over_time.rs` (`sampled-winrate-over-time`), plus the
+  twenty playerbase plots listed under [Playerbase plots](#playerbase-plots).
   Analysis-specific code stays in those files.
 - `src/dataset.rs` is the shared Parquet access boundary, including the player
-  and match-history aggregation shared by the player analyses and the UTC
-  hour-of-day counts shared by the two hour analyses.
+  and match-history aggregation shared by the player analyses, the UTC
+  hour-of-day counts shared by the two hour analyses, and the two-player match
+  loader (`load_duels`) and session splitting shared by the playerbase plots.
 - `src/plot.rs` is the shared chart theme, axis helpers, and reusable legend
   components.
 - `dataset/` is ignored local input data.
@@ -110,3 +112,47 @@ For `games-per-week`, which writes a single chart, `--output` is the exact PNG
 path. The per-season analyses write one PNG per season into the directory that
 holds `--output`, keeping the documented file names such as
 `elo_vs_games_season_11.png`.
+
+## Playerbase plots
+
+Twenty analyses look for surprises in the playerbase and how it changes within
+and across seasons. They are meant to be run over every season:
+
+```sh
+cargo run --release -- --dataset dataset --seasons all --analysis elo-calibration
+```
+
+Each writes one chart to `output/<name>.png` (`--output` is the exact path),
+except `peak-versus-final` and `top-ten-trajectories`, which write one chart
+per season. Elo values come from `changes[].eloRate`, the rating a player
+carried into the match; `players[].eloRate` is a stale profile snapshot and is
+not used. Titles carry the headline number, and the CLI report lists the values
+behind every point.
+
+| `--analysis` | What it shows |
+| --- | --- |
+| `split-evolution` | Median winner split at each route milestone (Nether, bastion, fortress, blind travel, stronghold, End) and finish, per season. |
+| `win-time-distribution` | Distribution of winning times, one curve per season. |
+| `season-retention` | Heatmap of the share of one season's players (10+ matches) who also played each other season. |
+| `veteran-edge` | Win rate of returning players against season debutants within 50 Elo of them. |
+| `elo-percentiles-by-season` | Final-Elo percentiles (p10–p99 and the top player) per season. |
+| `elo-calibration` | Higher-rated player's actual win rate against the Elo formula, by rating gap. |
+| `upsets-by-elo` | Underdog win rate at a 100–200 gap, by the pair's mean Elo. |
+| `peak-versus-final` | Per season: every player's peak Elo against how far they finished below it. |
+| `top-ten-trajectories` | Per season: daily closing Elo of the final top ten. |
+| `grind-curve` | Mean Elo gained over the first 300 rated matches by players who played that many. |
+| `streak-winrate` | Win rate above Elo expectation by the win or loss streak a player brings in. |
+| `session-fatigue` | Win rate above expectation by match number within a session. |
+| `quit-after-loss` | How much likelier a session is to end after a loss than a win, by Elo. |
+| `weekday-hour-heatmap` | Matches per UTC weekday and hour, relative to the weekly mean hour. |
+| `matchmaking-gap-by-hour` | Median, p75, and p90 pre-match Elo gap by UTC hour. |
+| `elo-by-hour` | Elo percentiles of the players queuing at each UTC hour. |
+| `milestone-lead-winrate` | Win rate of the player who reached each milestone first, by size of the lead. |
+| `deaths-versus-elo` | Timeline deaths per match for winners and losers, by Elo. |
+| `seed-bastion-win-time` | Median winning time for every overworld seed type and bastion pairing. |
+| `country-elo` | Final-Elo median and IQR for the 16 countries with the most player-seasons. |
+
+A session ends when a player starts no match within 30 minutes of their
+previous match ending. Win rates "vs Elo expectation" subtract the logistic
+400-point Elo prediction from the outcome, so they isolate what the rating does
+not already explain.

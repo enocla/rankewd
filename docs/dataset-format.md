@@ -121,3 +121,31 @@ Run `rankewd --analysis elo-versus-games` to aggregate match files by season and
 | `latest_elo_date` | nullable `int64` | Unix seconds timestamp for that Elo observation. |
 
 The analysis writes `elo_vs_games_season_N.png`, `elo_distribution_season_N.png`, `elo_vs_win_duration_season_N.png`, and `name_underscores_vs_elo_season_N.png` for each season containing a rated player. The Elo distribution chart uses 50 point bins. `elo_vs_win_duration_season_N.png` scatters rated players by their final Elo and the arithmetic mean, in seconds, of `result.time` over their qualifying wins, using a logarithmic duration axis. A qualifying win has `type = 2`, `decayed = false`, and `forfeited = false`, its winner UUID appears in `players`, and its `result.time` is greater than zero. That chart requires at least 10 qualifying wins per player, because a mean over fewer wins is too noisy to correlate, and it reports how many rated players were excluded. `name_underscores_vs_elo_season_N.png` draws one box per underscore count in the nickname recorded alongside each player's final Elo. Boxes span the first to third quartile with the median in red, and whiskers reach the furthest value still within 1.5xIQR of the quartiles; values past the fences are counted as outliers and reported per group. Groups below 20 players are skipped and reported, because a box of a handful of players would not describe a distribution. The two win-rate charts are written for seasons with qualifying data and are limited to player-season rows with at least 100 match appearances. `winrate_vs_elo_season_N.png` shows player rates and a mean player rate line for 100 Elo bins with at least 20 players. `winrate_over_time_season_N.png` plots each qualifying player's match-time Elo against their cumulative win rate through that match; a smooth color gradient shows progress from the first to last match date in the season. The Parquet table retains all players regardless of these chart filters. Matches without a recorded winner are excluded from win-rate denominators and do not update cumulative rates. When `--output PATH` is supplied, its parent becomes the output directory, its stem is used for the primary Elo-versus-games chart, and the other artifacts use their standard names. Existing files are not removed when a season no longer qualifies.
+
+
+## Playerbase plots
+
+The twenty playerbase analyses listed in the README read one shared
+projection of each match. Only rows with `decayed = false` and
+`forfeited = false` and exactly two distinct participant UUIDs contribute.
+
+- **Elo** is `changes[].eloRate`, the rating a player carried into the match;
+  the rating after it is `eloRate + change`. `players[].eloRate` is a profile
+  snapshot that stays constant across many matches and is not used. A player's
+  final Elo is their last post-match rating of the season and their peak the
+  highest one. Season 1 stores `changes[].eloRate` as a double; it is rounded.
+- **Elo expectation** is `1 / (1 + 10^((opponent - own) / 400))`. Charts that
+  report win rate "vs Elo expectation" average the outcome minus this value.
+- **Milestones** are the first `timelines` event of each type per player:
+  `story.enter_the_nether`, `nether.find_bastion`, `nether.find_fortress`,
+  `projectelo.timeline.blind_travel`, `story.follow_ender_eye`, and
+  `story.enter_the_end`. Deaths count `projectelo.timeline.death` events.
+  `split-evolution` keeps only wins that record all six milestones.
+- **Seed and bastion type** come from `seedType` and `bastionType`, falling back
+  to `seed.overworld` and `seed.nether` when a season leaves them empty.
+- **Sessions** end when a player's next match starts more than 30 minutes after
+  the previous one ended (`date + result.time`).
+- **Veterans** are players who appear in an earlier selected season, so
+  `veteran-edge` and `season-retention` need several seasons selected.
+- **Countries** use the last country code a player-season lists; player-seasons
+  without one are counted in the report and skipped.

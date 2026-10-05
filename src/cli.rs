@@ -11,7 +11,11 @@ use std::path::PathBuf;
     about = "Analyze Rankewd Parquet datasets",
     after_help = "Available analyses: records, games-per-week, games-per-player, games-per-hour, hour-entropy, rolling-win-duration, \
 elo-versus-games, elo-versus-win-duration, name-underscores-versus-elo, elo-distribution, winrate-versus-elo, winrate-over-time, \
-sampled-winrate-over-time\n\nEach analysis runs on its own; the plot analyses write one PNG per season. All analyses exclude decayed and forfeited matches by default, except \
+sampled-winrate-over-time, \
+split-evolution, win-time-distribution, season-retention, veteran-edge, elo-percentiles-by-season, elo-calibration, upsets-by-elo, \
+peak-versus-final, top-ten-trajectories, grind-curve, streak-winrate, session-fatigue, quit-after-loss, weekday-hour-heatmap, \
+matchmaking-gap-by-hour, elo-by-hour, milestone-lead-winrate, deaths-versus-elo, seed-bastion-win-time, country-elo\n\nEach analysis runs on its own \
+and renders one plot: single-output analyses write one chart spanning the selected seasons, per-season analyses one PNG per season. All analyses exclude decayed and forfeited matches by default, except \
 games-per-hour and hour-entropy, which describe when matches are played rather than how they ended and so keep forfeited matches.\n\nUse --dataset dataset --seasons all to select every season_N_*.parquet file."
 )]
 struct Cli {

@@ -19,6 +19,28 @@ mod sampled_winrate_over_time;
 mod winrate_over_time;
 mod winrate_versus_elo;
 
+// Cross-season, Elo-system, behavioral, and in-game analyses.
+mod country_elo;
+mod deaths_versus_elo;
+mod elo_by_hour;
+mod elo_calibration;
+mod elo_percentiles_by_season;
+mod grind_curve;
+mod matchmaking_gap_by_hour;
+mod milestone_lead_winrate;
+mod peak_versus_final;
+mod quit_after_loss;
+mod season_retention;
+mod seed_bastion_win_time;
+mod session_fatigue;
+mod split_evolution;
+mod streak_winrate;
+mod top_ten_trajectories;
+mod upsets_by_elo;
+mod veteran_edge;
+mod weekday_hour_heatmap;
+mod win_time_distribution;
+
 /// Directory used for generated artifacts when `--output` is omitted.
 pub const DEFAULT_OUTPUT_DIRECTORY: &str = "output";
 
@@ -133,6 +155,26 @@ pub fn available() -> Vec<Box<dyn Analysis>> {
         Box::new(winrate_versus_elo::WinrateVersusElo),
         Box::new(winrate_over_time::WinrateOverTime),
         Box::new(sampled_winrate_over_time::SampledWinrateOverTime),
+        Box::new(split_evolution::SplitEvolution),
+        Box::new(win_time_distribution::WinTimeDistribution),
+        Box::new(season_retention::SeasonRetention),
+        Box::new(veteran_edge::VeteranEdge),
+        Box::new(elo_percentiles_by_season::EloPercentilesBySeason),
+        Box::new(elo_calibration::EloCalibration),
+        Box::new(upsets_by_elo::UpsetsByElo),
+        Box::new(peak_versus_final::PeakVersusFinal),
+        Box::new(top_ten_trajectories::TopTenTrajectories),
+        Box::new(grind_curve::GrindCurve),
+        Box::new(streak_winrate::StreakWinrate),
+        Box::new(session_fatigue::SessionFatigue),
+        Box::new(quit_after_loss::QuitAfterLoss),
+        Box::new(weekday_hour_heatmap::WeekdayHourHeatmap),
+        Box::new(matchmaking_gap_by_hour::MatchmakingGapByHour),
+        Box::new(elo_by_hour::EloByHour),
+        Box::new(milestone_lead_winrate::MilestoneLeadWinrate),
+        Box::new(deaths_versus_elo::DeathsVersusElo),
+        Box::new(seed_bastion_win_time::SeedBastionWinTime),
+        Box::new(country_elo::CountryElo),
     ]
 }
 
